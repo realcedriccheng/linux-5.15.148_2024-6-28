@@ -492,6 +492,9 @@ void blk_mq_sched_insert_requests(struct blk_mq_hw_ctx *hctx,
 	struct elevator_queue *e;
 	struct request_queue *q = hctx->queue;
 
+	struct request *rq;/* FG - BG */
+	bool is_passthrough = false;/* FG - BG */
+
 	/*
 	 * blk_mq_sched_insert_requests() is called from flush plug
 	 * context only, and hold one usage counter to prevent queue
@@ -499,8 +502,13 @@ void blk_mq_sched_insert_requests(struct blk_mq_hw_ctx *hctx,
 	 */
 	percpu_ref_get(&q->q_usage_counter);
 
+	list_for_each_entry(rq, list, queuelist) {/* FG - BG */
+		is_passthrough = blk_rq_is_passthrough(rq);
+		break;
+	}
+
 	e = hctx->queue->elevator;
-	if (e) {
+	if (!is_passthrough && e) {/* FG - BG */
 		e->type->ops.insert_requests(hctx, list, false);
 	} else {
 		/*

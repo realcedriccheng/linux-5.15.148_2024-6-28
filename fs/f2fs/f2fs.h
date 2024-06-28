@@ -28,6 +28,9 @@
 #include <linux/fscrypt.h>
 #include <linux/fsverity.h>
 
+#define QWJ_DEBUG_FS
+// #define FG_PID_LIST
+
 #ifdef CONFIG_F2FS_CHECK_FS
 #define f2fs_bug_on(sbi, condition)	BUG_ON(condition)
 #else
@@ -163,6 +166,15 @@ struct f2fs_mount_info {
 	int compress_mode;			/* compression mode */
 	unsigned char extensions[COMPRESS_EXT_NUM][F2FS_EXTENSION_LEN];	/* extensions */
 	unsigned char noextensions[COMPRESS_EXT_NUM][F2FS_EXTENSION_LEN]; /* extensions */
+	/* For cwj_pi */
+
+	bool cwj_pi;
+	bool qwj_no_fsync;
+	bool qwj_buffer_io;
+	bool qwj_use_zone_append;
+	bool qwj_flush_buffer_io;
+	bool qwj_fg_app_io;// FG - BG
+	bool qwj_no_zone_write_lock;// FG - BG
 };
 
 #define F2FS_FEATURE_ENCRYPT		0x0001
@@ -283,6 +295,31 @@ struct fsync_node_entry {
 	struct page *page;	/* warm node page pointer */
 	unsigned int seq_id;	/* sequence id */
 };
+
+#ifdef CONFIG_BLK_DEV_ZONED
+struct zone_append_entry {
+	struct list_head list;	/* list head */
+	struct page *page;	/* zone_append page pointer */
+	unsigned int seq_id;	/* sequence id */
+};
+
+struct bio_post_write_end_io_ctx {
+	struct bio *bio;
+	struct f2fs_sb_info *sbi;
+	struct work_struct work;
+	struct page *ipage;
+	int is_inline;
+	block_t zone_pointer;
+	// unsigned int enabled_steps;
+	// /*
+	//  * decompression_attempted keeps track of whether
+	//  * f2fs_end_read_compressed_page() has been called on the pages in the
+	//  * bio that belong to a compressed cluster yet.
+	//  */
+	// bool decompression_attempted;
+	// block_t fs_blkaddr;
+};
+#endif
 
 struct ckpt_req {
 	struct completion wait;		/* completion for checkpoint done */
@@ -1164,6 +1201,9 @@ struct f2fs_io_info {
 	int op_flags;		/* req_flag_bits */
 	block_t new_blkaddr;	/* new block address to be written */
 	block_t old_blkaddr;	/* old block address before Cow */
+#ifdef CONFIG_BLK_DEV_ZONED
+	block_t zone_pointer;
+#endif
 	struct page *page;	/* page to be written */
 	struct page *encrypted_page;	/* encrypted page */
 	struct page *compressed_page;	/* compressed page */
@@ -1193,6 +1233,11 @@ struct f2fs_bio_info {
 	struct bio *bio;		/* bios to merge */
 	sector_t last_block_in_bio;	/* last block number */
 	struct f2fs_io_info fio;	/* store buffered io info. */
+#ifdef CONFIG_BLK_DEV_ZONED
+	struct completion zone_wait;	/* condition value for the previous open zone to close */
+	struct bio *zone_pending_bio;	/* pending bio for the previous zone */
+	void *bi_private;		/* previous bi_private for pending bio */
+#endif
 	struct rw_semaphore io_rwsem;	/* blocking op for bio */
 	spinlock_t io_lock;		/* serialize DATA/NODE IOs */
 	struct list_head io_list;	/* track fios */
@@ -1565,9 +1610,21 @@ struct f2fs_sb_info {
 	unsigned long s_flag;				/* flags for sbi */
 	struct mutex writepages;		/* mutex for writepages() */
 
+#ifdef FG_PID_LIST
+	unsigned int fg_app_list[3];
+	struct rw_semaphore fg_app_list_lock;
+#endif
+
 #ifdef CONFIG_BLK_DEV_ZONED
 	unsigned int blocks_per_blkz;		/* F2FS blocks per zone */
 	unsigned int log_blocks_per_blkz;	/* log2 F2FS blocks per zone */
+	unsigned int max_active_zones;		/* max zone resources of the zoned device */
+	atomic_t available_active_zones;		/* remaining zone resources */
+	struct workqueue_struct *post_write_end_io_wq;	/* post f2fs_write_end_io workqueue */
+	spinlock_t zone_append_lock;		/* for zone_append entry lock */
+	struct list_head zone_append_list;	/* zone_append list head */
+	unsigned int zone_append_seg_id;		/* sequence id */
+	unsigned int zone_append_num;		/* number of zone_append entries */
 #endif
 
 	/* for node-related operations */
@@ -3412,6 +3469,13 @@ bool f2fs_in_warm_node_list(struct f2fs_sb_info *sbi, struct page *page);
 void f2fs_init_fsync_node_info(struct f2fs_sb_info *sbi);
 void f2fs_del_fsync_node_entry(struct f2fs_sb_info *sbi, struct page *page);
 void f2fs_reset_fsync_node_info(struct f2fs_sb_info *sbi);
+#ifdef CONFIG_BLK_DEV_ZONED
+void f2fs_init_zone_append_info(struct f2fs_sb_info *sbi);
+unsigned int f2fs_add_zone_append_entry(struct f2fs_sb_info *sbi,
+							struct page *page);
+void f2fs_del_zone_append_entry(struct f2fs_sb_info *sbi, struct page *page);
+void f2fs_reset_zone_append_info(struct f2fs_sb_info *sbi);
+#endif
 int f2fs_need_dentry_mark(struct f2fs_sb_info *sbi, nid_t nid);
 bool f2fs_is_checkpointed_node(struct f2fs_sb_info *sbi, nid_t nid);
 bool f2fs_need_inode_block_update(struct f2fs_sb_info *sbi, nid_t ino);
@@ -3489,6 +3553,9 @@ void f2fs_save_inmem_curseg(struct f2fs_sb_info *sbi);
 void f2fs_restore_inmem_curseg(struct f2fs_sb_info *sbi);
 void f2fs_get_new_segment(struct f2fs_sb_info *sbi,
 			unsigned int *newseg, bool new_sec, int dir);
+#ifdef CONFIG_BLK_DEV_ZONED
+int __get_segment_type(struct f2fs_io_info *fio);
+#endif
 void f2fs_allocate_segment_for_resize(struct f2fs_sb_info *sbi, int type,
 					unsigned int start, unsigned int end);
 void f2fs_allocate_new_section(struct f2fs_sb_info *sbi, int type, bool force);
@@ -3606,6 +3673,15 @@ void f2fs_flush_merged_writes(struct f2fs_sb_info *sbi);
 int f2fs_submit_page_bio(struct f2fs_io_info *fio);
 int f2fs_merge_page_bio(struct f2fs_io_info *fio);
 void f2fs_submit_page_write(struct f2fs_io_info *fio);
+#ifdef CONFIG_BLK_DEV_ZONED
+block_t f2fs_sector_to_blkaddr(struct f2fs_sb_info *sbi,
+		sector_t sector, struct block_device *bdev);
+void f2fs_submit_page_write_zone_append(struct f2fs_io_info *fio, struct page *ipage, int type);
+int f2fs_wait_on_zone_append_pages_writeback(struct f2fs_sb_info *sbi,
+						unsigned int seq_id);
+struct block_device *f2fs_target_device2(struct f2fs_sb_info *sbi,
+		block_t blk_addr, sector_t *sector);
+#endif
 struct block_device *f2fs_target_device(struct f2fs_sb_info *sbi,
 			block_t blk_addr, struct bio *bio);
 int f2fs_target_device_index(struct f2fs_sb_info *sbi, block_t blkaddr);
@@ -3648,8 +3724,16 @@ bool f2fs_overwrite_io(struct inode *inode, loff_t pos, size_t len);
 void f2fs_clear_page_cache_dirty_tag(struct page *page);
 int f2fs_init_post_read_processing(void);
 void f2fs_destroy_post_read_processing(void);
+#ifdef CONFIG_BLK_DEV_ZONED
+	int f2fs_init_post_write_end_io_processing(void);
+	void f2fs_destroy_post_write_end_io_processing(void);
+#endif
 int f2fs_init_post_read_wq(struct f2fs_sb_info *sbi);
 void f2fs_destroy_post_read_wq(struct f2fs_sb_info *sbi);
+#ifdef CONFIG_BLK_DEV_ZONED
+	int f2fs_init_post_write_end_io_wq(struct f2fs_sb_info *sbi);
+	void f2fs_destroy_post_write_end_io_wq(struct f2fs_sb_info *sbi);
+#endif
 
 /*
  * gc.c
@@ -3918,6 +4002,10 @@ extern const struct inode_operations f2fs_symlink_inode_operations;
 extern const struct inode_operations f2fs_encrypted_symlink_inode_operations;
 extern const struct inode_operations f2fs_special_inode_operations;
 extern struct kmem_cache *f2fs_inode_entry_slab;
+
+#ifdef QWJ_DEBUG_FS
+int procfs_stat_show(struct seq_file *s, void *v);
+#endif
 
 /*
  * inline.c
@@ -4239,6 +4327,22 @@ static inline bool f2fs_blkz_is_seq(struct f2fs_sb_info *sbi, int devi,
 
 	return test_bit(zno, FDEV(devi).blkz_seq);
 }
+
+static inline int f2fs_bdev_index(struct f2fs_sb_info *sbi,
+				  struct block_device *bdev)
+{
+	int i;
+
+	if (!f2fs_is_multi_device(sbi))
+		return 0;
+
+	for (i = 0; i < sbi->s_ndevs; i++)
+		if (FDEV(i).bdev == bdev)
+			return i;
+
+	WARN_ON(1);
+	return -1;
+}
 #endif
 
 static inline bool f2fs_hw_should_discard(struct f2fs_sb_info *sbi)
@@ -4348,8 +4452,13 @@ static inline bool f2fs_force_buffered_io(struct inode *inode,
 	 * for blkzoned device, fallback direct IO to buffered IO, so
 	 * all IOs can be serialized by log-structured write.
 	 */
-	if (f2fs_sb_has_blkzoned(sbi))
-		return true;
+	if (F2FS_OPTION(sbi).qwj_buffer_io == true){
+		// if (f2fs_sb_has_blkzoned(sbi))//加速conv的小写
+			return true;
+	}else{
+		if (f2fs_sb_has_blkzoned(sbi))
+			return true;
+	}
 	if (f2fs_lfs_mode(sbi) && (rw == WRITE)) {
 		if (block_unaligned_IO(inode, iocb, iter))
 			return true;

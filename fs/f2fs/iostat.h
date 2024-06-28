@@ -39,6 +39,9 @@ struct bio_iostat_ctx {
 	unsigned long submit_ts;
 	enum page_type type;
 	struct bio_post_read_ctx *post_read_ctx;
+#ifdef CONFIG_BLK_DEV_ZONED
+	struct bio_post_write_end_io_ctx *post_write_end_io_ctx;
+#endif
 };
 
 static inline void iostat_update_submit_ctx(struct bio *bio,
@@ -58,8 +61,13 @@ static inline struct bio_post_read_ctx *get_post_read_ctx(struct bio *bio)
 }
 
 extern void iostat_update_and_unbind_ctx(struct bio *bio, int rw);
+#ifdef CONFIG_BLK_DEV_ZONED
+extern void iostat_alloc_and_bind_ctx(struct f2fs_sb_info *sbi,
+		struct bio *bio, struct bio_post_read_ctx *ctx, struct bio_post_write_end_io_ctx *w_ctx);
+#else
 extern void iostat_alloc_and_bind_ctx(struct f2fs_sb_info *sbi,
 		struct bio *bio, struct bio_post_read_ctx *ctx);
+#endif
 extern int f2fs_init_iostat_processing(void);
 extern void f2fs_destroy_iostat_processing(void);
 extern int f2fs_init_iostat(struct f2fs_sb_info *sbi);
@@ -68,8 +76,13 @@ extern void f2fs_destroy_iostat(struct f2fs_sb_info *sbi);
 static inline void f2fs_update_iostat(struct f2fs_sb_info *sbi,
 		enum iostat_type type, unsigned long long io_bytes) {}
 static inline void iostat_update_and_unbind_ctx(struct bio *bio, int rw) {}
+#ifdef CONFIG_BLK_DEV_ZONED
+static inline void iostat_alloc_and_bind_ctx(struct f2fs_sb_info *sbi,
+		struct bio *bio, struct bio_post_read_ctx *ctx, struct bio_post_write_end_io_ctx *w_ctx) {}
+#else
 static inline void iostat_alloc_and_bind_ctx(struct f2fs_sb_info *sbi,
 		struct bio *bio, struct bio_post_read_ctx *ctx) {}
+#endif
 static inline void iostat_update_submit_ctx(struct bio *bio,
 		enum page_type type) {}
 static inline struct bio_post_read_ctx *get_post_read_ctx(struct bio *bio)

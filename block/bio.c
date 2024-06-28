@@ -213,8 +213,10 @@ void bio_uninit(struct bio *bio)
 		bio->bi_blkg = NULL;
 	}
 #endif
-	if (bio_integrity(bio))
-		bio_integrity_free(bio);
+	if (!bio->is_cwj_pi){//cwj_oob
+		if (bio_integrity(bio))
+				bio_integrity_free(bio);
+	}//cwj_oob
 
 	bio_crypt_free_ctx(bio);
 }
@@ -276,6 +278,7 @@ void bio_init(struct bio *bio, struct bio_vec *table,
 #endif
 #ifdef CONFIG_BLK_DEV_INTEGRITY
 	bio->bi_integrity = NULL;
+	bio->is_cwj_pi = 0;//cwj_oob
 #endif
 	bio->bi_vcnt = 0;
 
@@ -1445,8 +1448,10 @@ void bio_endio(struct bio *bio)
 again:
 	if (!bio_remaining_done(bio))
 		return;
-	if (!bio_integrity_endio(bio))
-		return;
+	if (!bio->is_cwj_pi){
+		if (!bio_integrity_endio(bio))
+			return;
+	}
 
 	rq_qos_done_bio(bio);
 

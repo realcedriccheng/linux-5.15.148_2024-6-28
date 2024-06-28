@@ -1034,6 +1034,97 @@ static struct kobj_type f2fs_feature_list_ktype = {
 	.release	= f2fs_feature_list_kobj_release,
 };
 
+#ifdef FG_PID_LIST
+static ssize_t foreground_app_list_read(struct file *file, char __user *user_buf,
+				       size_t count, loff_t *pos)
+{
+	struct f2fs_sb_info *sbi = F2FS_SB(PDE_DATA(file->f_inode));
+	int num, iter, divisor;
+	unsigned int id;
+	char buf[100];
+	ssize_t ret_cnt;
+
+	num = 0;
+	down_read(&sbi->fg_app_list_lock);
+	for (iter = 0; iter < 3; iter++) {
+		divisor = 1;
+		id = sbi->fg_app_list[iter];
+		while (id > 9) {
+			id /= 10;
+			divisor *= 10;
+		}
+		id = sbi->fg_app_list[iter];
+		while (divisor > 0) {
+			int digit = id / divisor;
+			id %= divisor;
+			divisor /= 10;
+			
+			buf[num++] = digit + '0';
+		}
+		buf[num++] = ',';
+	}
+	up_read(&sbi->fg_app_list_lock);
+
+	buf[num++] = '\n';
+
+	ret_cnt = simple_read_from_buffer(user_buf, count, pos, buf, num);
+
+	return ret_cnt;
+}
+
+/* 123,456,789,   max id 4294967295(2^32-1 )*/
+static ssize_t foreground_app_list_write(struct file *file, const char __user *buffer,
+				       size_t count, loff_t *pos)
+{
+	int num, i, j, d, iter;
+	unsigned long ret = 0;
+	char buf[100];
+	struct f2fs_sb_info *sbi = F2FS_SB(PDE_DATA(file->f_inode));
+	num = 0;
+	iter = 0;
+	down_write(&sbi->fg_app_list_lock);
+	for (i = 0; i < count; i++) {
+		char c;
+		if (get_user(c, buffer))
+			break;
+		if (iter == 3)// stop
+			break;
+		if (c != ',') {
+			buf[num++] = c;
+		} else {
+			ret = 0;
+			d = 0;
+			j = 0;
+			while (j < num) {
+				d = buf[j] - '0';
+				if (d > 9) {
+					printk(KERN_INFO "[%s] input error!!\n", __func__);
+					break;
+				}
+				ret += d;
+				ret *= 10;
+				j++;
+			}
+			ret /= 10;
+			sbi->fg_app_list[iter++] = ret;
+			ret = 0;
+			num = 0;
+		}
+		buffer++;
+	}
+	for (iter = 0; iter < 3; iter++) {
+		printk("sbi->fg_app_list[%d] = %u\n", iter, sbi->fg_app_list[iter]);
+	}
+	up_write(&sbi->fg_app_list_lock);
+
+	return count;
+}
+static const struct proc_ops foreground_app_list_proc_fops = {
+	.proc_read		= foreground_app_list_read,
+	.proc_write		= foreground_app_list_write,
+};
+#endif
+
 static int __maybe_unused segment_info_seq_show(struct seq_file *seq,
 						void *offset)
 {
@@ -1060,6 +1151,18 @@ static int __maybe_unused segment_info_seq_show(struct seq_file *seq,
 
 	return 0;
 }
+
+#ifdef QWJ_DEBUG_FS
+static int __maybe_unused stat_seq_show(struct seq_file *seq,
+						void *offset)
+{
+	// struct super_block *sb = seq->private;
+	// struct f2fs_sb_info *sbi = F2FS_SB(sb);
+
+	procfs_stat_show(seq, offset);
+	return 0;
+}
+#endif
 
 static int __maybe_unused segment_bits_seq_show(struct seq_file *seq,
 						void *offset)
@@ -1167,6 +1270,14 @@ int f2fs_register_sysfs(struct f2fs_sb_info *sbi)
 		sbi->s_proc = proc_mkdir(sb->s_id, f2fs_proc_root);
 
 	if (sbi->s_proc) {
+#ifdef FG_PID_LIST
+		proc_create_data("foreground_app_list", 0666, sbi->s_proc,
+				&foreground_app_list_proc_fops, sb);
+#endif
+#ifdef QWJ_DEBUG_FS
+		proc_create_single_data("stat", 0444, sbi->s_proc,
+				stat_seq_show, sb);
+#endif
 		proc_create_single_data("segment_info", 0444, sbi->s_proc,
 				segment_info_seq_show, sb);
 		proc_create_single_data("segment_bits", 0444, sbi->s_proc,
@@ -1199,6 +1310,12 @@ void f2fs_unregister_sysfs(struct f2fs_sb_info *sbi)
 #endif
 		remove_proc_entry("segment_info", sbi->s_proc);
 		remove_proc_entry("segment_bits", sbi->s_proc);
+#ifdef QWJ_DEBUG_FS
+		remove_proc_entry("stat", sbi->s_proc);
+#endif
+#ifdef FG_PID_LIST
+		remove_proc_entry("foreground_app_list", sbi->s_proc);
+#endif
 		remove_proc_entry("victim_bits", sbi->s_proc);
 		remove_proc_entry(sbi->sb->s_id, f2fs_proc_root);
 	}

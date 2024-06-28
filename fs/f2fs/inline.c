@@ -172,6 +172,11 @@ int f2fs_convert_inline_page(struct dnode_of_data *dn, struct page *page)
 	dirty = clear_page_dirty_for_io(page);
 
 	/* write data page to try to make data consistent */
+// #ifdef CONFIG_BLK_DEV_ZONED
+// 	if ((F2FS_OPTION(F2FS_I_SB(dn->inode)).qwj_use_zone_append == true) && (__get_segment_type(&fio) <= CURSEG_WARM_DATA)){
+// 		f2fs_add_zone_append_entry(fio.sbi, page);
+// 	}
+// #endif
 	set_page_writeback(page);
 	ClearPageError(page);
 	fio.old_blkaddr = dn->data_blkaddr;

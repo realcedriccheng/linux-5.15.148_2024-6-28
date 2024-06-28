@@ -52,6 +52,12 @@ const char *blk_zone_cond_str(enum blk_zone_cond zone_cond)
 }
 EXPORT_SYMBOL_GPL(blk_zone_cond_str);
 
+bool blk_no_zone_write_lock(struct request *rq)/* unlock FG - BG */
+{
+	return blk_queue_no_zone_write_lock(rq->q) &&
+		rq->cmd_flags & REQ_NO_ZONE_WRITE_LOCK;
+}
+EXPORT_SYMBOL_GPL(blk_no_zone_write_lock);
 /*
  * Return true if a request is a write requests that needs zone write locking.
  */

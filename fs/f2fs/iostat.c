@@ -225,14 +225,29 @@ void iostat_update_and_unbind_ctx(struct bio *bio, int rw)
 
 	if (rw == 0)
 		bio->bi_private = iostat_ctx->post_read_ctx;
+#ifdef CONFIG_BLK_DEV_ZONED
+	else{
+		if (bio_op(bio) == REQ_OP_ZONE_APPEND){
+			bio->bi_private = iostat_ctx->post_write_end_io_ctx;
+		}else{
+			bio->bi_private = iostat_ctx->sbi;
+		}
+	}
+#else
 	else
 		bio->bi_private = iostat_ctx->sbi;
+#endif
 	__update_iostat_latency(iostat_ctx, rw, is_sync);
 	mempool_free(iostat_ctx, bio_iostat_ctx_pool);
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+void iostat_alloc_and_bind_ctx(struct f2fs_sb_info *sbi,
+		struct bio *bio, struct bio_post_read_ctx *ctx, struct bio_post_write_end_io_ctx *write_end_io_ctx)
+#else
 void iostat_alloc_and_bind_ctx(struct f2fs_sb_info *sbi,
 		struct bio *bio, struct bio_post_read_ctx *ctx)
+#endif
 {
 	struct bio_iostat_ctx *iostat_ctx;
 	/* Due to the mempool, this never fails. */
@@ -241,6 +256,9 @@ void iostat_alloc_and_bind_ctx(struct f2fs_sb_info *sbi,
 	iostat_ctx->submit_ts = 0;
 	iostat_ctx->type = 0;
 	iostat_ctx->post_read_ctx = ctx;
+#ifdef CONFIG_BLK_DEV_ZONED
+	iostat_ctx->post_write_end_io_ctx = write_end_io_ctx;
+#endif
 	bio->bi_private = iostat_ctx;
 }
 

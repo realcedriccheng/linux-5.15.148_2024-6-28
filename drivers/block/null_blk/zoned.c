@@ -2,6 +2,7 @@
 #include <linux/vmalloc.h>
 #include <linux/bitmap.h>
 #include "null_blk.h"
+#include "zns_ftl.h"
 
 #define CREATE_TRACE_POINTS
 #include "trace.h"
@@ -37,8 +38,13 @@ static inline void null_init_zone_lock(struct nullb_device *dev,
 		mutex_init(&zone->mutex);
 }
 
+#ifdef SLC_CACHE
+inline void null_lock_zone(struct nullb_device *dev,
+				  struct nullb_zone *zone)
+#else
 static inline void null_lock_zone(struct nullb_device *dev,
 				  struct nullb_zone *zone)
+#endif
 {
 	if (!dev->memory_backed)
 		spin_lock_irq(&zone->spinlock);
@@ -46,8 +52,13 @@ static inline void null_lock_zone(struct nullb_device *dev,
 		mutex_lock(&zone->mutex);
 }
 
+#ifdef SLC_CACHE
+inline void null_unlock_zone(struct nullb_device *dev,
+				    struct nullb_zone *zone)
+#else
 static inline void null_unlock_zone(struct nullb_device *dev,
 				    struct nullb_zone *zone)
+#endif
 {
 	if (!dev->memory_backed)
 		spin_unlock_irq(&zone->spinlock);
@@ -93,6 +104,9 @@ int null_init_zoned_dev(struct nullb_device *dev, struct request_queue *q)
 
 	spin_lock_init(&dev->zone_res_lock);
 
+	if (dev->no_zone_write_lock)/* unlock FG - BG */
+		blk_queue_flag_set(QUEUE_FLAG_NO_ZONE_WRITE_LOCK, q);
+
 	if (dev->zone_nr_conv >= dev->nr_zones) {
 		dev->zone_nr_conv = dev->nr_zones - 1;
 		pr_info("changed the number of conventional zones to %u",
@@ -136,6 +150,9 @@ int null_init_zoned_dev(struct nullb_device *dev, struct request_queue *q)
 
 		null_init_zone_lock(dev, zone);
 		zone->start = zone->wp = sector;
+#ifdef SLC_CACHE
+		zone->wp_tlc = zone->wp;
+#endif
 		if (zone->start + dev->zone_size_sects > dev_capacity_sects)
 			zone->len = dev_capacity_sects - zone->start;
 		else
@@ -370,6 +387,7 @@ static blk_status_t null_zone_write(struct nullb_cmd *cmd, sector_t sector,
 	unsigned int zno = null_zone_no(dev, sector);
 	struct nullb_zone *zone = &dev->zones[zno];
 	blk_status_t ret;
+	// uint64_t tmp1,tmp2;
 
 	trace_nullb_zone_op(cmd, zno, zone->cond);
 
@@ -399,9 +417,13 @@ static blk_status_t null_zone_write(struct nullb_cmd *cmd, sector_t sector,
 			cmd->bio->bi_iter.bi_sector = sector;
 		else
 			cmd->rq->__sector = sector;
+#ifdef SLC_CACHE
+
+#else
 	} else if (sector != zone->wp) {
 		ret = BLK_STS_IOERR;
 		goto unlock;
+#endif
 	}
 
 	if (zone->wp + nr_sectors > zone->start + zone->capacity) {
@@ -431,7 +453,56 @@ static blk_status_t null_zone_write(struct nullb_cmd *cmd, sector_t sector,
 		null_unlock_zone_res(dev);
 	}
 
+#ifdef ZNS_FTL
+#ifdef SLC_CACHE
+	if (dev->zufs && dev->zns_ftl) {
+		sector_t sector_tmp = sector;
+		unsigned int nr_sectors_tmp = nr_sectors;
+		struct zns_ftl *zns_ftl = cmd->nq->dev->zns_ftl;
+		mutex_lock(&zns_ftl->write_lock);
+		if (cmd->queue_id == 1) {
+			if (dev->slc_cache){
+				// printk("zns_write_slc");
+				// printk("queue_id 1 SLC write : zone->start = %lu zone->wp_tlc = %lu zone->wp = %lu sector_tmp = %lu nr_sectors_tmp = %lu\n",zone->start, zone->wp_tlc, zone->wp, sector_tmp, nr_sectors_tmp);
+				zns_write_slc(cmd, sector_tmp, nr_sectors_tmp, zone);
+			}
+		} else {
+			// printk("zns_write_slc wp:%u, sector_tmp:%u, nr_sectors_tmp:%u",zone->wp,sector,nr_sectors_tmp);
+			// zns_write_slc(cmd, sector_tmp, nr_sectors_tmp);
+			// printk("null_zone_write: zone->wp:%lu, sector_tmp:%lu, nr_sectors_tmp:%lu\n",zone->wp,sector,nr_sectors_tmp);
+			if (zns_read_slc(cmd, &sector_tmp, &nr_sectors_tmp, zone) && dev->slc_cache) {
+				// printk("queue_id 2 SLC write : zone->start = %lu zone->wp_tlc = %lu zone->wp = %lu sector_tmp = %lu nr_sectors_tmp = %lu\n",zone->start, zone->wp_tlc, zone->wp, sector_tmp, nr_sectors_tmp);
+				zns_write_slc(cmd, sector_tmp, nr_sectors_tmp, zone);
+			} else {
+				// cmd, nr_sectors_tmp+=slc_nr_sectors;
+				// tmp1=cpu_clock(1);
+				// printk("queue_id 2 TLC write : zone->start = %lu zone->wp_tlc = %lu zone->wp = %lu sector_tmp = %lu nr_sectors_tmp = %lu\n",zone->start, zone->wp_tlc, zone->wp, sector_tmp, nr_sectors_tmp);
+
+				zns_write(cmd, sector_tmp, nr_sectors_tmp);
+				// BUG_ON(1);
+			}
+		}
+		if (atomic_read(&dev->slc_cache->slcp.active_zones) > 1)
+			printk("atomic_read(&dev->slc_cache->slcp.active_zones) = %ld\n",atomic_read(&dev->slc_cache->slcp.active_zones));
+		mutex_unlock(&zns_ftl->write_lock);
+		cmd->nsecs_start = cmd->nsecs_start_slc;
+	}
+#else
+	// tmp1=cpu_clock(1);
+	if (dev->zufs && dev->zns_ftl){
+		struct zns_ftl *zns_ftl = cmd->nq->dev->zns_ftl;
+		mutex_lock(&zns_ftl->write_lock);
+		zns_write(cmd, sector, nr_sectors);
+		mutex_unlock(&zns_ftl->write_lock);
+	}
+#endif
+	// tmp2=cpu_clock(1);
+	// printk("zufs-cal--- %llu cmd late = %llu\n",tmp2-tmp1,cmd->nsecs_target - cmd->nsecs_start);
+#endif
+	// tmp1=cpu_clock(1);
 	ret = null_process_cmd(cmd, REQ_OP_WRITE, sector, nr_sectors);
+	// tmp2=cpu_clock(1);
+	// printk("zufs-trans---%llu\n",tmp2-tmp1);
 	if (ret != BLK_STS_OK)
 		goto unlock;
 
@@ -550,6 +621,9 @@ static blk_status_t null_finish_zone(struct nullb_device *dev,
 
 	zone->cond = BLK_ZONE_COND_FULL;
 	zone->wp = zone->start + zone->len;
+#ifdef SLC_CACHE
+	zone->wp_tlc = zone->wp;
+#endif
 
 unlock:
 	null_unlock_zone_res(dev);
@@ -588,6 +662,9 @@ static blk_status_t null_reset_zone(struct nullb_device *dev,
 
 	zone->cond = BLK_ZONE_COND_EMPTY;
 	zone->wp = zone->start;
+#ifdef SLC_CACHE
+	zone->wp_tlc = zone->wp;
+#endif
 
 	null_unlock_zone_res(dev);
 
@@ -671,6 +748,11 @@ blk_status_t null_process_zoned_cmd(struct nullb_cmd *cmd, enum req_opf op,
 	default:
 		dev = cmd->nq->dev;
 		zone = &dev->zones[null_zone_no(dev, sector)];
+
+#ifdef ZNS_FTL
+		if (dev->zufs && dev->zns_ftl && (op == REQ_OP_READ))
+			zns_read(cmd, sector, nr_sectors);
+#endif
 
 		null_lock_zone(dev, zone);
 		sts = null_process_cmd(cmd, op, sector, nr_sectors);

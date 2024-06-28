@@ -110,6 +110,7 @@ void bio_integrity_free(struct bio *bio)
 	bio->bi_integrity = NULL;
 	bio->bi_opf &= ~REQ_INTEGRITY;
 }
+EXPORT_SYMBOL(bio_integrity_free);//cwj_oob
 
 /**
  * bio_integrity_add_page - Attach integrity metadata

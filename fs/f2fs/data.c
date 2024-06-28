@@ -21,6 +21,10 @@
 #include <linux/cleancache.h>
 #include <linux/sched/signal.h>
 #include <linux/fiemap.h>
+// #include <linux/blk-integrity.h>
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+#include <linux/cwj_integrity.h>
+#endif
 
 #include "f2fs.h"
 #include "node.h"
@@ -119,6 +123,227 @@ struct bio_post_read_ctx {
 	unsigned int enabled_steps;
 	block_t fs_blkaddr;
 };
+
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+static blk_status_t cwj_bio_integrity_process(struct bio *bio,
+		struct bvec_iter *proc_iter, integrity_processing_fn *proc_fn)
+{
+	struct blk_integrity *bi = blk_get_integrity(bio->bi_bdev->bd_disk);
+	struct blk_integrity_iter iter;
+	struct bvec_iter bviter;
+	struct bio_vec bv;
+	struct bio_integrity_payload *bip = bio_integrity(bio);
+	blk_status_t ret = BLK_STS_OK;
+	int i = 0;
+
+	iter.disk_name = bio->bi_bdev->bd_disk->disk_name;
+	iter.interval = 1 << bi->interval_exp;
+	// iter.tuple_size = bi->tuple_size;
+	iter.seed = proc_iter->bi_sector;//这是什么？
+	iter.prot_buf = bvec_virt(bip->bip_vec);//
+	__bio_for_each_segment(bv, bio, bviter, *proc_iter) {
+		// void *kaddr = bvec_kmap_local(&bv);
+		void *kaddr = &bv;
+		// printk("i=%d\n",i);
+		i++;
+		// printk("bv.bv_page->index=%d\n",bv.bv_page->index);
+		iter.data_buf = kaddr;
+		iter.data_size = bv.bv_len;
+		ret = proc_fn(&iter);
+		// kunmap_local(kaddr);
+
+		if (ret)
+			break;
+
+	}
+	return ret;
+}
+static bool cwj_bio_integrity_prep(struct bio *bio)
+{
+	struct bio_integrity_payload *bip;
+	struct blk_integrity *bi = blk_get_integrity(bio->bi_bdev->bd_disk);
+	void *buf;
+	unsigned long start, end;
+	unsigned int len, nr_pages;
+	unsigned int bytes, offset, i;
+	if(bio==NULL)
+	{
+		printk(KERN_INFO "bio=null\n");
+		goto err_end_io;
+	}
+	if(bio->bi_bdev==NULL)
+	{
+		printk(KERN_INFO "bio->bi_bdev==NULL\n");
+		goto err_end_io;
+	}
+	if(bio->bi_bdev->bd_disk==NULL)
+	{
+		printk(KERN_INFO "bio->bi_bdev->bd_disk==NULL\n");
+		goto err_end_io;
+	}
+	if(bi==NULL)
+	{
+		printk(KERN_INFO "bi==NULL\n");
+		goto err_end_io;
+	}
+
+	/* Allocate kernel buffer for protection data */
+	len = bio_integrity_bytes(bi, bio_sectors(bio));
+	// printk("bi->interval_exp = %lu, len = %lu\n",bi->interval_exp, len);
+	buf = kmalloc(len, GFP_NOIO);
+	if (unlikely(buf == NULL)) {
+		printk(KERN_ERR "could not allocate integrity buffer\n");
+		goto err_end_io;
+	}
+
+	end = (((unsigned long) buf) + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	start = ((unsigned long) buf) >> PAGE_SHIFT;
+	nr_pages = end - start;
+
+	/* Allocate bio integrity payload and integrity vectors */
+	bip = bio_integrity_alloc(bio, GFP_NOIO, nr_pages);
+	if (IS_ERR(bip)) {
+		printk(KERN_ERR "could not allocate data integrity bioset\n");
+		kfree(buf);
+		goto err_end_io;
+	}
+
+	bip->bip_flags |= BIP_BLOCK_INTEGRITY;
+	bip->bip_iter.bi_size = len;//add qwj
+	bip_set_seed(bip, bio->bi_iter.bi_sector);
+
+	if (bi->flags & BLK_INTEGRITY_IP_CHECKSUM)
+		bip->bip_flags |= BIP_IP_CHECKSUM;
+
+	/* Map it */
+	offset = offset_in_page(buf);
+	for (i = 0; i < nr_pages && len > 0; i++) {
+		bytes = PAGE_SIZE - offset;
+
+		if (bytes > len)
+			bytes = len;
+
+		if (bio_integrity_add_page(bio, virt_to_page(buf),
+					   bytes, offset) < bytes) {
+			printk(KERN_ERR "could not attach integrity payload\n");
+			goto err_end_io;
+		}
+
+		buf += bytes;
+		len -= bytes;
+		offset = 0;
+	}
+		/* Auto-generate integrity metadata if this is a write */
+	// if (bio_data_dir(bio) == WRITE) {
+	if ((bio_op(bio) == REQ_OP_WRITE) || (bio_op(bio) == REQ_OP_ZONE_APPEND)){
+		cwj_bio_integrity_process(bio, &bio->bi_iter,bi->profile->generate_fn);
+	} else {
+		bip->bio_iter = bio->bi_iter;
+	}
+	return true;
+
+err_end_io:
+	bio->bi_status = BLK_STS_RESOURCE;
+	bio_endio(bio);
+	return false;
+}
+#endif
+
+#ifdef CONFIG_BLK_DEV_ZONED
+#define NUM_PREALLOC_POST_WRITE_END_IO_CTXS 1024
+static struct kmem_cache *bio_post_write_end_io_ctx_cache;
+static mempool_t *bio_post_write_end_io_ctx_pool;
+static struct kmem_cache *zone_append_entry_slab;
+
+void f2fs_init_zone_append_info(struct f2fs_sb_info *sbi)
+{
+	spin_lock_init(&sbi->zone_append_lock);
+	INIT_LIST_HEAD(&sbi->zone_append_list);
+	sbi->zone_append_seg_id = 0;
+	sbi->zone_append_num = 0;
+}
+
+unsigned int f2fs_add_zone_append_entry(struct f2fs_sb_info *sbi,
+							struct page *page)
+{
+	struct zone_append_entry *fn;
+	unsigned long flags;
+	unsigned int seq_id;
+
+	fn = f2fs_kmem_cache_alloc(zone_append_entry_slab,
+					GFP_NOFS, true, NULL);
+
+	get_page(page);
+	fn->page = page;
+	INIT_LIST_HEAD(&fn->list);
+
+	spin_lock_irqsave(&sbi->zone_append_lock, flags);
+	list_add_tail(&fn->list, &sbi->zone_append_list);
+	fn->seq_id = sbi->zone_append_seg_id++;
+	seq_id = fn->seq_id;
+	sbi->zone_append_num++;
+	spin_unlock_irqrestore(&sbi->zone_append_lock, flags);
+
+	return seq_id;
+}
+
+void f2fs_del_zone_append_entry(struct f2fs_sb_info *sbi, struct page *page)
+{
+	struct zone_append_entry *fn;
+	unsigned long flags;
+
+	spin_lock_irqsave(&sbi->zone_append_lock, flags);
+	list_for_each_entry(fn, &sbi->zone_append_list, list) {
+		if (fn->page == page) {
+			list_del(&fn->list);
+			sbi->zone_append_num--;
+			spin_unlock_irqrestore(&sbi->zone_append_lock, flags);
+			kmem_cache_free(zone_append_entry_slab, fn);
+			put_page(page);
+			// printk("sbi->zone_append_num = %lu\n",sbi->zone_append_num);
+			return;
+		}
+	}
+	spin_unlock_irqrestore(&sbi->zone_append_lock, flags);
+	f2fs_bug_on(sbi, 1);
+}
+
+void f2fs_reset_zone_append_info(struct f2fs_sb_info *sbi)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&sbi->zone_append_lock, flags);
+	sbi->zone_append_seg_id = 0;
+	spin_unlock_irqrestore(&sbi->zone_append_lock, flags);
+}
+
+int f2fs_wait_on_zone_append_pages_writeback(struct f2fs_sb_info *sbi,
+						unsigned int seq_id)
+{
+	struct zone_append_entry *fn;
+	struct page *page;
+	struct list_head *head = &sbi->zone_append_list;
+	unsigned long flags;
+retry:
+	spin_lock_irqsave(&sbi->zone_append_lock, flags);
+	if (!list_empty(head)) {
+		fn = list_first_entry(head, struct zone_append_entry, list);
+
+		page = fn->page;
+		get_page(page);
+		spin_unlock_irqrestore(&sbi->zone_append_lock, flags);
+
+		f2fs_wait_on_page_writeback(page, DATA, true, false);
+
+		put_page(page);
+		goto retry;
+	}else{
+		spin_unlock_irqrestore(&sbi->zone_append_lock, flags);
+	}
+
+	return 0;
+}
+#endif
 
 static void f2fs_finish_read_bio(struct bio *bio)
 {
@@ -268,10 +493,288 @@ static void f2fs_post_read_work(struct work_struct *work)
 	f2fs_verify_and_finish_bio(ctx->bio);
 }
 
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+// extern blk_status_t bio_integrity_process(struct bio *bio,struct bvec_iter *proc_iter, integrity_processing_fn *proc_fn);
+extern void bio_integrity_free(struct bio *bio);
+#endif
+
+#ifdef CONFIG_BLK_DEV_ZONED
+static void f2fs_post_write_end_io_work(struct work_struct *work)
+{
+	struct bio_post_write_end_io_ctx *ctx =
+		container_of(work, struct bio_post_write_end_io_ctx, work);
+	struct bio *bio = ctx->bio;
+	struct f2fs_sb_info *sbi;
+	struct bio_vec *bvec;
+	struct bvec_iter_all iter_all;
+	block_t page_blkaddr = 0;
+
+	// if ((ctx->enabled_steps & STEP_DECRYPT) && !fscrypt_decrypt_bio(bio)) {
+	// 	f2fs_finish_read_bio(bio, true);
+	// 	return;
+	// }
+
+	// iostat_update_and_unbind_ctx(bio, 1);
+	sbi = ctx->sbi;
+
+	// if (time_to_inject(sbi, FAULT_WRITE_IO))
+	// 	bio->bi_status = BLK_STS_IOERR;
+
+	page_blkaddr = f2fs_sector_to_blkaddr(sbi, bio->bi_iter.bi_sector, bio->bi_bdev);
+	// if (unlikely(ctx->zone_pointer != page_blkaddr)){
+	// 	f2fs_printk(sbi, "ctx->zone_pointer = %u, f2fs_zone_append_end_io:page_blkaddr = %u, sector = %llu\n",ctx->zone_pointer, page_blkaddr, bio->bi_iter.bi_sector);
+	// 	// BUG();
+	// 	// f2fs_bug_on(sbi, ctx->zone_pointer != page_blkaddr);
+	// }
+	bio_for_each_segment_all(bvec, bio, iter_all) {
+		struct page *page = bvec->bv_page;
+		enum count_type type = WB_DATA_TYPE(page);
+		struct dnode_of_data dn;
+		struct inode *inode = page->mapping->host;
+		struct f2fs_summary_block *sum_blk;
+		struct f2fs_summary sum;
+		struct node_info ni;
+		struct page *sum_page;
+		unsigned int segno;
+		int err = 0;
+
+		if (page_private_dummy(page)) {
+			clear_page_private_dummy(page);
+			unlock_page(page);
+			mempool_free(page, sbi->write_io_dummy);
+
+			if (unlikely(bio->bi_status))
+				f2fs_stop_checkpoint(sbi, true);
+			continue;
+		}
+		// f2fs_printk(sbi, "f2fs_zone_append_end_io: page->index = %lu\n", page->index);
+		segno = GET_SEGNO(sbi, page_blkaddr);
+		sum_page = f2fs_get_sum_page(sbi, segno);
+		f2fs_put_page(sum_page, 1);
+		if(ctx->is_inline == 0){
+			// if (!f2fs_is_atomic_file(inode)){
+				set_new_dnode(&dn, inode, NULL, NULL, 0);
+			// }
+			// f2fs_lock_op(sbi);
+			err = f2fs_get_dnode_of_data(&dn, page->index, LOOKUP_NODE);
+			// f2fs_printk(sbi, "err1 = %d\n",err);
+			if (err)
+				goto next;
+			/* This page is already truncated */
+			if (dn.data_blkaddr == NULL_ADDR) {
+				ClearPageUptodate(page);
+				goto next_put_dnode;
+			}
+		}else{
+			f2fs_bug_on(sbi, (ctx->is_inline != 1));
+			f2fs_bug_on(sbi, (bio->bi_vcnt > 1));
+			// f2fs_printk(sbi,"bio->bi_vcnt = %d",bio->bi_vcnt);
+			set_new_dnode(&dn, inode, ctx->ipage, ctx->ipage, 0);
+			err = f2fs_get_dnode_of_data(&dn, page->index, LOOKUP_NODE);
+			// f2fs_printk(sbi, "err1 = %d\n",err);
+			if (err)
+				goto next;
+		}
+		err = f2fs_get_node_info(sbi, dn.nid, &ni, false);
+		// f2fs_printk(sbi, "err2 = %d\n",err);
+		if (err)
+			goto next_put_dnode;
+			
+		sum_page = f2fs_get_sum_page(sbi, segno);
+		if (IS_ERR(sum_page)) {
+			// f2fs_printk(sbi, "IS_ERR(sum_page)----segno = %lu\n", segno);
+			goto next_put_dnode;
+		}
+		sum_blk = page_address(sum_page);
+		set_summary(&sum, dn.nid, dn.ofs_in_node, ni.version);
+		
+		sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, page_blkaddr)] = sum;
+		set_page_dirty(sum_page);
+		f2fs_put_page(sum_page, 1);
+		
+		// f2fs_printk(sbi, "f2fs_update_data_blkaddr\n");
+		f2fs_update_data_blkaddr(&dn, page_blkaddr);
+		// f2fs_unlock_op(sbi);
+next_put_dnode:
+		if(ctx->is_inline == 0){
+			f2fs_put_dnode(&dn);
+		}
+next:
+		page_blkaddr++;
+
+		f2fs_del_zone_append_entry(sbi, page);
+		// iput(inode);
+		dec_page_count(sbi, type);
+	}
+	if (!get_pages(sbi, F2FS_WB_CP_DATA) &&
+				wq_has_sleeper(&sbi->cp_wait))
+		wake_up(&sbi->cp_wait);
+
+	if (ctx)
+		mempool_free(ctx, bio_post_write_end_io_ctx_pool);
+
+	bio_put(bio);
+}
+// static void f2fs_post_write_end_io_work(struct work_struct *work)
+// {
+// 	struct bio_post_write_end_io_ctx *ctx =
+// 		container_of(work, struct bio_post_write_end_io_ctx, work);
+// 	struct bio *bio = ctx->bio;
+// 	struct f2fs_sb_info *sbi;
+// 	struct bio_vec *bvec;
+// 	struct bvec_iter_all iter_all;
+// 	block_t page_blkaddr = 0;
+
+// 	// if ((ctx->enabled_steps & STEP_DECRYPT) && !fscrypt_decrypt_bio(bio)) {
+// 	// 	f2fs_finish_read_bio(bio, true);
+// 	// 	return;
+// 	// }
+
+// 	// iostat_update_and_unbind_ctx(bio, 1);
+// 	sbi = ctx->sbi;
+
+// 	// if (time_to_inject(sbi, FAULT_WRITE_IO))
+// 	// 	bio->bi_status = BLK_STS_IOERR;
+
+// 	page_blkaddr = f2fs_sector_to_blkaddr(sbi, bio->bi_iter.bi_sector, bio->bi_bdev);
+// 	// if (unlikely(ctx->zone_pointer != page_blkaddr)){
+// 	// 	f2fs_printk(sbi, "ctx->zone_pointer = %u, f2fs_zone_append_end_io:page_blkaddr = %u, sector = %llu\n",ctx->zone_pointer, page_blkaddr, bio->bi_iter.bi_sector);
+// 	// 	// BUG();
+// 	// 	// f2fs_bug_on(sbi, ctx->zone_pointer != page_blkaddr);
+// 	// }
+// 	bio_for_each_segment_all(bvec, bio, iter_all) {
+// 		struct page *page = bvec->bv_page;
+// 		enum count_type type = WB_DATA_TYPE(page);
+// 		struct dnode_of_data dn;
+// 		struct inode *inode = page->mapping->host;
+// 		struct f2fs_summary_block *sum_blk;
+// 		struct f2fs_summary sum;
+// 		struct node_info ni;
+// 		struct page *sum_page;
+// 		unsigned int segno;
+// 		int err = 0;
+
+// 		if (page_private_dummy(page)) {
+// 			clear_page_private_dummy(page);
+// 			unlock_page(page);
+// 			mempool_free(page, sbi->write_io_dummy);
+
+// 			if (unlikely(bio->bi_status))
+// 				f2fs_stop_checkpoint(sbi, true);
+// 			continue;
+// 		}
+// 		// f2fs_printk(sbi, "f2fs_zone_append_end_io: page->index = %lu\n", page->index);
+// 		segno = GET_SEGNO(sbi, page_blkaddr);
+// 		sum_page = f2fs_get_sum_page(sbi, segno);
+// 		f2fs_put_page(sum_page, 1);
+// 		if(ctx->is_inline == 0){
+// 			// if (!f2fs_is_atomic_file(inode)){
+// 				set_new_dnode(&dn, inode, NULL, NULL, 0);
+// 			// }
+// 			// f2fs_lock_op(sbi);
+// 			err = f2fs_get_dnode_of_data(&dn, page->index, LOOKUP_NODE);
+// 			// f2fs_printk(sbi, "err1 = %d\n",err);
+// 			if (err)
+// 				goto next;
+// 			/* This page is already truncated */
+// 			if (dn.data_blkaddr == NULL_ADDR) {
+// 				ClearPageUptodate(page);
+// 				goto next_put_dnode;
+// 			}
+// 		}else{
+// 			f2fs_bug_on(sbi, (ctx->is_inline != 1));
+// 			f2fs_bug_on(sbi, (bio->bi_vcnt > 1));
+// 			// f2fs_printk(sbi,"bio->bi_vcnt = %d",bio->bi_vcnt);
+// 			set_new_dnode(&dn, inode, ctx->ipage, ctx->ipage, 0);
+// 			err = f2fs_get_dnode_of_data(&dn, page->index, LOOKUP_NODE);
+// 			// f2fs_printk(sbi, "err1 = %d\n",err);
+// 			if (err)
+// 				goto next;
+// 		}
+// 		err = f2fs_get_node_info(sbi, dn.nid, &ni, false);
+// 		// f2fs_printk(sbi, "err2 = %d\n",err);
+// 		if (err)
+// 			goto next_put_dnode;
+			
+// 		sum_page = f2fs_get_sum_page(sbi, segno);
+// 		if (IS_ERR(sum_page)) {
+// 			// f2fs_printk(sbi, "IS_ERR(sum_page)----segno = %lu\n", segno);
+// 			goto next_put_dnode;
+// 		}
+// 		sum_blk = page_address(sum_page);
+// 		set_summary(&sum, dn.nid, dn.ofs_in_node, ni.version);
+		
+// 		sum_blk->entries[GET_BLKOFF_FROM_SEG0(sbi, page_blkaddr)] = sum;
+// 		set_page_dirty(sum_page);
+// 		f2fs_put_page(sum_page, 1);
+		
+// 		// f2fs_printk(sbi, "f2fs_update_data_blkaddr\n");
+// 		f2fs_update_data_blkaddr(&dn, page_blkaddr);
+// 		// f2fs_unlock_op(sbi);
+// next_put_dnode:
+// 		if(ctx->is_inline == 0){
+// 			f2fs_put_dnode(&dn);
+// 		}
+// next:
+// 		page_blkaddr++;
+
+// 		f2fs_del_zone_append_entry(sbi, page);
+
+// 		fscrypt_finalize_bounce_page(&page);
+
+// #ifdef CONFIG_F2FS_FS_COMPRESSION
+// 		if (f2fs_is_compressed_page(page)) {
+// 			f2fs_compress_write_end_io(bio, page);
+// 			continue;
+// 		}
+// #endif
+
+// 		if (unlikely(bio->bi_status)) {
+// 			mapping_set_error(page->mapping, -EIO);
+// 			if (type == F2FS_WB_CP_DATA)
+// 				f2fs_stop_checkpoint(sbi, true);
+// 		}
+
+// 		// f2fs_bug_on(sbi, page->mapping == NODE_MAPPING(sbi) &&
+// 		// 			page->index != nid_of_node(page));
+
+// 		dec_page_count(sbi, type);
+// 		// if (f2fs_in_warm_node_list(sbi, page))
+// 		// 	f2fs_del_fsync_node_entry(sbi, page);
+// 		clear_page_private_gcing(page);
+// 		end_page_writeback(page);
+// 	}
+// 	if (!get_pages(sbi, F2FS_WB_CP_DATA) &&
+// 				wq_has_sleeper(&sbi->cp_wait))
+// 		wake_up(&sbi->cp_wait);
+// 	if (ctx)
+// 		mempool_free(ctx, bio_post_write_end_io_ctx_pool);
+
+// 	bio_put(bio);
+// }
+#endif
+
 static void f2fs_read_end_io(struct bio *bio)
 {
 	struct f2fs_sb_info *sbi = F2FS_P_SB(bio_first_page_all(bio));
 	struct bio_post_read_ctx *ctx;
+
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+	// printk("->f2fs_read_end_io\n");
+	//bip
+	struct bio_integrity_payload *bip = bio_integrity(bio);
+	struct blk_integrity *bi = blk_get_integrity(bio->bi_bdev->bd_disk);
+	if(F2FS_OPTION(sbi).cwj_pi)
+	{
+		if(bip)
+		{	
+			bio->bi_status = cwj_bio_integrity_process(bio, &bip->bio_iter,
+			// bio->bi_status = bio_integrity_process(bio, &bip->bio_iter,
+							bi->profile->verify_fn);
+			bio_integrity_free(bio);
+		}
+	}
+#endif
 
 	iostat_update_and_unbind_ctx(bio, 0);
 	ctx = bio->bi_private;
@@ -353,6 +856,178 @@ static void f2fs_write_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+static void f2fs_zone_append_end_io(struct bio *bio)
+{
+	struct f2fs_sb_info *sbi;
+	struct bio_vec *bvec;
+	struct bvec_iter_all iter_all;
+	// block_t page_blkaddr = 0;
+	struct bio_post_write_end_io_ctx *ctx = NULL;
+
+	iostat_update_and_unbind_ctx(bio, 1);
+	ctx = bio->bi_private;
+	sbi = ctx->sbi;
+
+	if (time_to_inject(sbi, FAULT_WRITE_IO)){
+		f2fs_show_injection_info(sbi, FAULT_WRITE_IO);
+		bio->bi_status = BLK_STS_IOERR;
+	}
+
+	bio_for_each_segment_all(bvec, bio, iter_all) {
+		struct page *page = bvec->bv_page;
+		enum count_type type = WB_DATA_TYPE(page);
+
+		if (page_private_dummy(page)) {
+			continue;
+		}
+
+		fscrypt_finalize_bounce_page(&page);
+
+#ifdef CONFIG_F2FS_FS_COMPRESSION
+		if (f2fs_is_compressed_page(page)) {
+			f2fs_compress_write_end_io(bio, page);
+			continue;
+		}
+#endif
+
+		if (unlikely(bio->bi_status)) {
+			mapping_set_error(page->mapping, -EIO);
+			if (type == F2FS_WB_CP_DATA)
+				f2fs_stop_checkpoint(sbi, true);
+		}
+
+		f2fs_bug_on(sbi, page->mapping == NODE_MAPPING(sbi) &&
+					page->index != nid_of_node(page));
+
+		// dec_page_count(sbi, type);
+		// if (f2fs_in_warm_node_list(sbi, page))
+		// 	f2fs_del_fsync_node_entry(sbi, page);
+		clear_page_private_gcing(page);
+
+		// igrab(page->mapping->host);
+
+		end_page_writeback(page);
+	}
+
+	// page_blkaddr = f2fs_sector_to_blkaddr(sbi, bio->bi_iter.bi_sector, bio->bi_bdev);
+	// f2fs_printk(sbi, "f2fs_zone_append_end_io:page_blkaddr = %lu, sector = %lu\n",page_blkaddr, bio->bi_iter.bi_sector);
+	INIT_WORK(&ctx->work, f2fs_post_write_end_io_work);
+	queue_work(ctx->sbi->post_write_end_io_wq, &ctx->work);
+}
+
+// static void f2fs_zone_append_end_io(struct bio *bio)
+// {
+// 	struct f2fs_sb_info *sbi;
+// 	// struct bio_vec *bvec;
+// 	// struct bvec_iter_all iter_all;
+// 	// block_t page_blkaddr = 0;
+// 	struct bio_post_write_end_io_ctx *ctx = NULL;
+
+// 	iostat_update_and_unbind_ctx(bio, 1);
+// 	ctx = bio->bi_private;
+// 	sbi = ctx->sbi;
+
+// 	if (time_to_inject(sbi, FAULT_WRITE_IO)){
+// 		f2fs_show_injection_info(sbi, FAULT_WRITE_IO);
+// 		bio->bi_status = BLK_STS_IOERR;
+// 	}
+
+// 	// page_blkaddr = f2fs_sector_to_blkaddr(sbi, bio->bi_iter.bi_sector, bio->bi_bdev);
+// 	// f2fs_printk(sbi, "f2fs_zone_append_end_io:page_blkaddr = %lu, sector = %lu\n",page_blkaddr, bio->bi_iter.bi_sector);
+// 	INIT_WORK(&ctx->work, f2fs_post_write_end_io_work);
+// 	queue_work(ctx->sbi->post_write_end_io_wq, &ctx->work);
+// }
+
+static void f2fs_zone_write_end_io_zone_append(struct bio *bio)
+{
+	struct f2fs_bio_info *io = (struct f2fs_bio_info *)bio->bi_private;
+
+	bio->bi_private = io->bi_private;
+	complete(&io->zone_wait);
+	f2fs_zone_append_end_io(bio);
+}
+
+static void f2fs_zone_write_end_io_zone_append_nowait(struct bio *bio)
+{
+#ifdef CONFIG_F2FS_IOSTAT
+	struct bio_iostat_ctx *iostat_ctx = bio->bi_private;
+	struct f2fs_sb_info *sbi = iostat_ctx->sbi;
+#else
+	struct bio_post_write_end_io_ctx *ctx = bio->bi_private;
+	struct f2fs_sb_info *sbi = ctx->sbi;
+#endif
+
+	atomic_inc(&sbi->available_active_zones);
+	f2fs_zone_append_end_io(bio);
+}
+#endif
+
+#ifdef CONFIG_BLK_DEV_ZONED
+static void f2fs_zone_write_end_io(struct bio *bio)
+{
+	struct f2fs_bio_info *io = (struct f2fs_bio_info *)bio->bi_private;
+
+	bio->bi_private = io->bi_private;
+	complete(&io->zone_wait);
+	f2fs_write_end_io(bio);
+}
+
+static void f2fs_zone_write_end_io_nowait(struct bio *bio)
+{
+#ifdef CONFIG_F2FS_IOSTAT
+	struct bio_iostat_ctx *iostat_ctx = bio->bi_private;
+	struct f2fs_sb_info *sbi = iostat_ctx->sbi;
+#else
+	struct f2fs_sb_info *sbi = (struct f2fs_sb_info *)bio->bi_private;
+#endif
+
+	atomic_inc(&sbi->available_active_zones);
+	f2fs_write_end_io(bio);
+}
+#endif
+
+#ifdef CONFIG_BLK_DEV_ZONED
+block_t f2fs_sector_to_blkaddr(struct f2fs_sb_info *sbi,
+		sector_t sector, struct block_device *bdev)
+{
+	// struct block_device *bdev = sbi->sb->s_bdev;/* Data zone isn't located in superdev */
+	int index = 0;
+	block_t blk_addr = 0;
+
+	blk_addr = SECTOR_TO_BLOCK(sector);
+	index = f2fs_bdev_index(sbi, bdev);
+
+	if (f2fs_is_multi_device(sbi)) {
+		blk_addr += FDEV(index).start_blk;
+	}
+
+	return blk_addr;
+}
+
+struct block_device *f2fs_target_device2(struct f2fs_sb_info *sbi,
+		block_t blk_addr, sector_t *sector)
+{
+	struct block_device *bdev = sbi->sb->s_bdev;
+	int i;
+
+	if (f2fs_is_multi_device(sbi)) {
+		for (i = 0; i < sbi->s_ndevs; i++) {
+			if (FDEV(i).start_blk <= blk_addr &&
+			    FDEV(i).end_blk >= blk_addr) {
+				blk_addr -= FDEV(i).start_blk;
+				bdev = FDEV(i).bdev;
+				break;
+			}
+		}
+	}
+
+	if (sector)
+		*sector = SECTOR_FROM_BLOCK(blk_addr);
+	return bdev;
+}
+#endif
+
 struct block_device *f2fs_target_device(struct f2fs_sb_info *sbi,
 				block_t blk_addr, struct bio *bio)
 {
@@ -400,19 +1075,67 @@ static struct bio *__bio_alloc(struct f2fs_io_info *fio, int npages)
 	if (is_read_io(fio->op)) {
 		bio->bi_end_io = f2fs_read_end_io;
 		bio->bi_private = NULL;
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+		if(F2FS_OPTION(sbi).cwj_pi)
+		{
+			bio->is_cwj_pi=1;
+		}
+#endif
 	} else {
 		bio->bi_end_io = f2fs_write_end_io;
 		bio->bi_private = sbi;
 		bio->bi_write_hint = f2fs_io_type_to_rw_hint(sbi,
 						fio->type, fio->temp);
 	}
+#ifdef CONFIG_BLK_DEV_ZONED
+	iostat_alloc_and_bind_ctx(sbi, bio, NULL, NULL);
+#else
 	iostat_alloc_and_bind_ctx(sbi, bio, NULL);
+#endif
 
 	if (fio->io_wbc)
 		wbc_init_bio(fio->io_wbc, bio);
 
 	return bio;
 }
+
+#ifdef CONFIG_BLK_DEV_ZONED
+static struct bio *__bio_alloc_zone_append(struct f2fs_io_info *fio, int npages, struct page *ipage, block_t zone_pointer)
+{
+	struct f2fs_sb_info *sbi = fio->sbi;
+	struct bio *bio;
+	struct bio_post_write_end_io_ctx *ctx = NULL;
+
+	bio = bio_alloc_bioset(GFP_NOIO, npages, &f2fs_bioset);
+
+	f2fs_target_device(sbi, fio->new_blkaddr, bio);
+	if (is_read_io(fio->op)) {
+		bio->bi_end_io = f2fs_read_end_io;
+		bio->bi_private = NULL;
+	} else {
+		ctx = mempool_alloc(bio_post_write_end_io_ctx_pool, GFP_NOFS);
+		ctx->is_inline = 0;
+		ctx->bio = bio;
+		ctx->sbi = sbi;
+		ctx->ipage = ipage;
+		ctx->zone_pointer = zone_pointer;
+		ctx->is_inline = is_inode_flag_set(fio->page->mapping->host, FI_INLINE_DATA);
+		bio->bi_end_io = f2fs_zone_append_end_io;
+		bio->bi_private = ctx;
+		bio->bi_write_hint = f2fs_io_type_to_rw_hint(sbi,
+						fio->type, fio->temp);
+	}
+	iostat_alloc_and_bind_ctx(sbi, bio, NULL, ctx);
+
+	if (fio->io_wbc)
+		wbc_init_bio(fio->io_wbc, bio);
+
+	bio->bi_opf &= ~REQ_OP_WRITE;
+	bio->bi_opf |= REQ_OP_ZONE_APPEND;
+
+	return bio;
+}
+#endif
 
 static void f2fs_set_bio_crypt_ctx(struct bio *bio, const struct inode *inode,
 				  pgoff_t first_idx,
@@ -491,6 +1214,26 @@ submit_io:
 		trace_f2fs_submit_write_bio(sbi->sb, type, bio);
 
 	iostat_update_submit_ctx(bio, type);
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+		if(F2FS_OPTION(sbi).cwj_pi && !is_read_io(bio_op(bio)))
+		{
+			if(!cwj_bio_integrity_prep(bio))
+			// if(!bio_integrity_prep(bio))
+			{
+				printk(KERN_INFO "--------cwj-绑定bip失败--------\n");
+				return;
+			}
+			bio->is_cwj_pi=0;
+			// printk(KERN_INFO "--------cwj-绑定bip成功--------\n");
+			// printk(KERN_INFO "--------cwj-获取bip--------\n");
+			// struct bio_integrity_payload *bip;
+			// bip=bio_integrity(bio);
+			// printk(KERN_INFO "--------cwj-打印bip内容--------\n");
+			// struct cwj_pi_tuple *pi = bvec_virt(bip->bip_vec);
+			// printk(KERN_INFO "write: bip->bip_vec:\npi->i_ino=%llu\n,pi->index=%llu\n",pi->i_ino,pi->index);
+			// printk(KERN_INFO "bip->bip_inline_vecs=%d",bip->bip_inline_vecs);
+		}
+#endif
 	submit_bio(bio);
 }
 
@@ -527,6 +1270,39 @@ static void __attach_io_flag(struct f2fs_io_info *fio)
 	if ((1 << fio->temp) & fua_flag)
 		fio->op_flags |= REQ_FUA;
 }
+
+// #ifdef CONFIG_BLK_DEV_ZONED
+// static blk_opf_t f2fs_io_flags_zone_append(struct f2fs_io_info *fio)
+// {
+// 	unsigned int temp_mask = GENMASK(NR_TEMP_TYPE - 1, 0);
+// 	unsigned int fua_flag, meta_flag, io_flag;
+// 	blk_opf_t op_flags = 0;
+
+// 	if ((fio->op != REQ_OP_ZONE_APPEND) && (fio->op != REQ_OP_WRITE))
+// 		return 0;
+// 	if (fio->type == DATA)
+// 		io_flag = fio->sbi->data_io_flag;
+// 	else if (fio->type == NODE)
+// 		io_flag = fio->sbi->node_io_flag;
+// 	else
+// 		return 0;
+
+// 	fua_flag = io_flag & temp_mask;
+// 	meta_flag = (io_flag >> NR_TEMP_TYPE) & temp_mask;
+
+// 	/*
+// 	 * data/node io flag bits per temp:
+// 	 *      REQ_META     |      REQ_FUA      |
+// 	 *    5 |    4 |   3 |    2 |    1 |   0 |
+// 	 * Cold | Warm | Hot | Cold | Warm | Hot |
+// 	 */
+// 	if (BIT(fio->temp) & meta_flag)
+// 		op_flags |= REQ_META;
+// 	if (BIT(fio->temp) & fua_flag)
+// 		op_flags |= REQ_FUA;
+// 	return op_flags;
+// }
+// #endif
 
 static void __submit_merged_bio(struct f2fs_bio_info *io)
 {
@@ -729,6 +1505,54 @@ static bool io_is_mergeable(struct f2fs_sb_info *sbi, struct bio *bio,
 	return io_type_is_mergeable(io, fio);
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+static bool page_is_mergeable_zone_append(struct f2fs_sb_info *sbi, struct bio *bio,
+				sector_t first_sector, block_t cur_blkaddr)
+{
+	sector_t sector;
+	struct block_device *bdev;
+	bdev = f2fs_target_device2(sbi, cur_blkaddr, &sector);
+
+	if (unlikely(sbi->max_io_bytes &&
+			bio->bi_iter.bi_size >= sbi->max_io_bytes))
+		return false;
+	if (first_sector != sector){
+		return false;
+	}
+	return bio->bi_bdev == bdev;
+}
+
+static bool io_type_is_mergeable_zone_append(struct f2fs_bio_info *io,
+						struct f2fs_io_info *fio)
+{
+	if (io->fio.op != fio->op)
+		return false;
+	return io->fio.op_flags == fio->op_flags;
+}
+static bool io_is_mergeable_zone_append(struct f2fs_sb_info *sbi, struct bio *bio,
+					struct f2fs_bio_info *io,
+					struct f2fs_io_info *fio,
+					sector_t first_sector,
+					block_t cur_blkaddr)
+{
+	if (F2FS_IO_ALIGNED(sbi) && (fio->type == DATA || fio->type == NODE)) {
+		unsigned int filled_blocks =
+				F2FS_BYTES_TO_BLK(bio->bi_iter.bi_size);
+		unsigned int io_size = F2FS_IO_SIZE(sbi);
+		unsigned int left_vecs = bio->bi_max_vecs - bio->bi_vcnt;
+
+		/* IOs in bio is aligned and left space of vectors is not enough */
+		if (!(filled_blocks % io_size) && left_vecs < io_size){
+			return false;
+		}
+	}
+	if (!page_is_mergeable_zone_append(sbi, bio, first_sector, cur_blkaddr)){
+		return false;
+	}
+	return io_type_is_mergeable_zone_append(io, fio);
+}
+#endif
+
 static void add_bio_entry(struct f2fs_sb_info *sbi, struct bio *bio,
 				struct page *page, enum temp_type temp)
 {
@@ -899,6 +1723,26 @@ alloc_new:
 	return 0;
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+static bool is_end_zone_blkaddr(struct f2fs_sb_info *sbi, block_t blkaddr)
+{
+	int devi = 0;
+
+	if (f2fs_is_multi_device(sbi)) {
+		devi = f2fs_target_device_index(sbi, blkaddr);
+		if (blkaddr < FDEV(devi).start_blk ||
+		    blkaddr > FDEV(devi).end_blk) {
+			f2fs_err(sbi, "Invalid block %x", blkaddr);
+			return false;
+		}
+		blkaddr -= FDEV(devi).start_blk;
+	}
+	return bdev_zoned_model(FDEV(devi).bdev) == BLK_ZONED_HM &&
+		f2fs_blkz_is_seq(sbi, devi, blkaddr) &&
+		(blkaddr % sbi->blocks_per_blkz == sbi->blocks_per_blkz - 1);
+}
+#endif
+
 void f2fs_submit_page_write(struct f2fs_io_info *fio)
 {
 	struct f2fs_sb_info *sbi = fio->sbi;
@@ -910,6 +1754,15 @@ void f2fs_submit_page_write(struct f2fs_io_info *fio)
 
 	down_write(&io->io_rwsem);
 next:
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (f2fs_sb_has_blkzoned(sbi) && btype < META && io->zone_pending_bio) {
+		wait_for_completion_io(&io->zone_wait);
+		printk("wait!-fio->new_blkaddr = %llu\n",fio->new_blkaddr);
+		bio_put(io->zone_pending_bio);
+		io->zone_pending_bio = NULL;
+		io->bi_private = NULL;
+	}
+#endif
 	if (fio->in_list) {
 		spin_lock(&io->io_lock);
 		if (list_empty(&io->io_list)) {
@@ -921,6 +1774,29 @@ next:
 		list_del(&fio->list);
 		spin_unlock(&io->io_lock);
 	}
+
+#ifdef FG_PID_LIST
+	if (F2FS_OPTION(sbi).qwj_fg_app_io == true) {
+		kuid_t uid = current_uid();
+		int i = 0;
+
+		if (uid.val == 0) {
+			fio->op_flags |= REQ_FG_APP_IO;// FG - BG REQ_FG_APP_IO
+		} else {
+			down_read(&sbi->fg_app_list_lock);
+			for (; i < 3; i++) {
+				if (sbi->fg_app_list[i] != 0 && sbi->fg_app_list[i] == uid.val)
+					fio->op_flags |= REQ_FG_APP_IO;// FG - BG REQ_FG_APP_IO
+			}
+			up_read(&sbi->fg_app_list_lock);
+		}
+
+		// printk("uid.val = %d  current->pid = %d \n", uid.val, current->pid);
+	}
+	if (F2FS_OPTION(sbi).qwj_no_zone_write_lock == true) {
+		fio->op_flags |= REQ_NO_ZONE_WRITE_LOCK;// FG - BG REQ_FG_APP_IO
+	}
+#endif
 
 	verify_fio_blkaddr(fio);
 
@@ -941,6 +1817,8 @@ next:
 			      fio->new_blkaddr) ||
 	     !f2fs_crypt_mergeable_bio(io->bio, fio->page->mapping->host,
 				       bio_page->index, fio)))
+		__submit_merged_bio(io);
+	if (io->bio && io->bio->bi_iter.bi_size >= 126976)
 		__submit_merged_bio(io);
 alloc_new:
 	if (io->bio == NULL) {
@@ -968,6 +1846,27 @@ alloc_new:
 	io->last_block_in_bio = fio->new_blkaddr;
 
 	trace_f2fs_submit_page_write(fio->page, fio);
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (f2fs_sb_has_blkzoned(sbi) && btype < META &&
+			is_end_zone_blkaddr(sbi, fio->new_blkaddr)) {
+		// if (!atomic_add_negative(-1, &sbi->available_active_zones)) {
+		// 	io->bio->bi_end_io = f2fs_zone_write_end_io_nowait;
+		// } else {
+		// 	atomic_inc(&sbi->available_active_zones);
+			bio_get(io->bio);
+			reinit_completion(&io->zone_wait);
+			io->bi_private = io->bio->bi_private;
+			io->bio->bi_private = io;
+			io->bio->bi_end_io = f2fs_zone_write_end_io;
+			io->zone_pending_bio = io->bio;
+		// }
+#ifdef FG_PID_LIST
+		io->fio.op_flags &= ~REQ_FG_APP_IO;
+		io->bio->bi_opf &= ~REQ_FG_APP_IO;
+#endif
+		__submit_merged_bio(io);
+	}
+#endif
 skip:
 	if (fio->in_list)
 		goto next;
@@ -977,6 +1876,132 @@ out:
 		__submit_merged_bio(io);
 	up_write(&io->io_rwsem);
 }
+
+#ifdef CONFIG_BLK_DEV_ZONED
+void f2fs_submit_page_write_zone_append(struct f2fs_io_info *fio, struct page *ipage, int type)
+{
+	struct f2fs_sb_info *sbi = fio->sbi;
+	enum page_type btype = PAGE_TYPE_OF_BIO(fio->type);
+	struct f2fs_bio_info *io = sbi->write_io[btype] + fio->temp;
+	struct page *bio_page;
+
+#ifdef CONFIG_BLK_DEV_ZONED
+	u64 max_zone_append_size;
+	struct block_device *bdev = f2fs_target_device2(sbi, fio->new_blkaddr, NULL);
+	max_zone_append_size = ALIGN_DOWN(
+		min3((u64)bdev->bd_disk->queue->limits.max_zone_append_sectors << SECTOR_SHIFT,
+		     (u64)bdev->bd_disk->queue->limits.max_sectors << SECTOR_SHIFT,
+		     (u64)bdev->bd_disk->queue->limits.max_segments << PAGE_SHIFT),
+		sbi->blocksize);
+#endif
+	// f2fs_printk(sbi,"f2fs_submit_page_write_zone_append");
+
+	f2fs_bug_on(sbi, is_read_io(fio->op));
+
+	down_write(&io->io_rwsem);
+next:
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (f2fs_sb_has_blkzoned(sbi) && btype < META && io->zone_pending_bio) {
+		wait_for_completion_io(&io->zone_wait);
+		bio_put(io->zone_pending_bio);
+		io->zone_pending_bio = NULL;
+		io->bi_private = NULL;
+	}
+#endif
+	if (fio->in_list) {
+		spin_lock(&io->io_lock);
+		if (list_empty(&io->io_list)) {
+			spin_unlock(&io->io_lock);
+			goto out;
+		}
+		fio = list_first_entry(&io->io_list,
+						struct f2fs_io_info, list);
+		list_del(&fio->list);
+		spin_unlock(&io->io_lock);
+	}
+
+	// verify_fio_blkaddr(fio);// ==================need FIX  new_addr may invalid
+	verify_blkaddr(sbi, fio->zone_pointer, __is_meta_io(fio) ?
+					META_GENERIC : DATA_GENERIC_ENHANCE);
+
+	if (fio->encrypted_page)
+		bio_page = fio->encrypted_page;
+	else if (fio->compressed_page)
+		bio_page = fio->compressed_page;
+	else
+		bio_page = fio->page;
+
+	/* set submitted = true as a return value */
+	fio->submitted = true;
+	// f2fs_target_device2(sbi, fio->new_blkaddr, &sector);
+	// printk("f2fs_submit_page_write_zone_append:SECTOR = %lu blkaddr = %lu\n", sector, fio->new_blkaddr);
+	inc_page_count(sbi, WB_DATA_TYPE(bio_page));
+	if (io->bio && is_inode_flag_set(fio->page->mapping->host, FI_INLINE_DATA) &&//need modify
+	    (!io_is_mergeable_zone_append(sbi, io->bio, io, fio, io->bio->bi_iter.bi_sector,
+			      fio->new_blkaddr) ||
+	     !f2fs_crypt_mergeable_bio(io->bio, fio->page->mapping->host,
+				       bio_page->index, fio)))
+		__submit_merged_bio(io);
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (io->bio && (bio_op(io->bio) == REQ_OP_ZONE_APPEND) && io->bio->bi_iter.bi_size >= max_zone_append_size)
+		__submit_merged_bio(io);
+#endif
+alloc_new:
+	if (io->bio == NULL) {
+		if (F2FS_IO_ALIGNED(sbi) &&
+				(fio->type == DATA || fio->type == NODE) &&
+				fio->new_blkaddr & F2FS_IO_SIZE_MASK(sbi)) {
+			dec_page_count(sbi, WB_DATA_TYPE(bio_page));
+			fio->retry = true;
+			goto skip;
+		}
+		io->bio = __bio_alloc_zone_append(fio, BIO_MAX_VECS, ipage, fio->zone_pointer);
+		f2fs_set_bio_crypt_ctx(io->bio, fio->page->mapping->host,
+				       bio_page->index, fio, GFP_NOIO);
+		io->fio = *fio;
+	}
+
+	if (bio_add_zone_append_page(io->bio, bio_page, PAGE_SIZE, 0) < PAGE_SIZE) {
+		__submit_merged_bio(io);
+		goto alloc_new;
+	}
+
+	if (fio->io_wbc)
+		wbc_account_cgroup_owner(fio->io_wbc, fio->page, PAGE_SIZE);
+
+	io->last_block_in_bio = fio->zone_pointer;
+
+	trace_f2fs_submit_page_write(fio->page, fio);
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (f2fs_sb_has_blkzoned(sbi) && btype < META && fio->zone_pointer &&
+			is_end_zone_blkaddr(sbi, fio->zone_pointer)) {//mod qwj
+		if (!atomic_add_negative(-1, &sbi->available_active_zones)) {
+			io->bio->bi_end_io = f2fs_zone_write_end_io_zone_append_nowait;
+		} else {
+			atomic_inc(&sbi->available_active_zones);
+			bio_get(io->bio);
+			reinit_completion(&io->zone_wait);
+			io->bi_private = io->bio->bi_private;
+			io->bio->bi_private = io;
+			io->bio->bi_end_io = f2fs_zone_write_end_io_zone_append;
+			io->zone_pending_bio = io->bio;
+		}
+		__submit_merged_bio(io);
+	}else if (f2fs_sb_has_blkzoned(sbi) && btype < META && (fio->page != NULL) && (fio->page->mapping != NULL) && (fio->page->mapping->host != NULL) &&
+			is_inode_flag_set(fio->page->mapping->host, FI_INLINE_DATA)){
+				__submit_merged_bio(io);
+	}
+#endif
+skip:
+	if (fio->in_list)
+		goto next;
+out:
+	if (is_sbi_flag_set(sbi, SBI_IS_SHUTDOWN) ||
+				!f2fs_is_checkpoint_ready(sbi))
+		__submit_merged_bio(io);
+	up_write(&io->io_rwsem);
+}
+#endif
 
 static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 				      unsigned nr_pages, unsigned op_flag,
@@ -996,6 +2021,12 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 
 	f2fs_target_device(sbi, blkaddr, bio);
 	bio->bi_end_io = f2fs_read_end_io;
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+	if(F2FS_OPTION(sbi).cwj_pi)
+	{
+		bio->is_cwj_pi=1;
+	}
+#endif
 	bio_set_op_attrs(bio, REQ_OP_READ, op_flag);
 
 	if (fscrypt_inode_uses_fs_layer_crypto(inode))
@@ -1020,7 +2051,11 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 		ctx->fs_blkaddr = blkaddr;
 		bio->bi_private = ctx;
 	}
+#ifdef CONFIG_BLK_DEV_ZONED
+	iostat_alloc_and_bind_ctx(sbi, bio, ctx, NULL);
+#else
 	iostat_alloc_and_bind_ctx(sbi, bio, ctx);
+#endif
 
 	return bio;
 }
@@ -1047,6 +2082,12 @@ static int f2fs_submit_page_read(struct inode *inode, struct page *page,
 	ClearPageError(page);
 	inc_page_count(sbi, F2FS_RD_DATA);
 	f2fs_update_iostat(sbi, FS_DATA_READ_IO, F2FS_BLKSIZE);
+// #ifdef CONFIG_BLK_DEV_INTEGRITY
+// 	if(F2FS_OPTION(sbi).cwj_pi)
+// 	{
+// 		bio->is_cwj_pi=1;
+// 	}
+// #endif
 	__submit_bio(sbi, bio, DATA);
 	return 0;
 }
@@ -2702,6 +3743,12 @@ got_it:
 	if (err)
 		goto out_writepage;
 
+// #ifdef CONFIG_BLK_DEV_ZONED
+// 	if ((F2FS_OPTION(fio->sbi).qwj_use_zone_append == true) && (fio->io_type != FS_GC_DATA_IO) && (__get_segment_type(fio) <= CURSEG_WARM_DATA)){
+// 		f2fs_add_zone_append_entry(fio->sbi, page);
+// 	}
+// #endif
+
 	set_page_writeback(page);
 	ClearPageError(page);
 
@@ -2756,6 +3803,13 @@ int f2fs_write_single_data_page(struct page *page, int *submitted,
 		.bio = bio,
 		.last_block = last_block,
 	};
+
+// #ifdef FG_PID_LIST
+// 	if (io_type == APP_BUFFERED_IO)
+// 	{
+// 		fio.op_flags |= REQ_FG_APP_IO;
+// 	}
+// #endif
 
 	trace_f2fs_writepage(page, DATA);
 
@@ -2958,13 +4012,19 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
 	int nwritten = 0;
 	int submitted = 0;
 	int i;
+// #ifdef FG_PID_LIST
+// 	int flag = 1;
+// #endif
 
 	pagevec_init(&pvec);
 
+// #ifdef FG_PID_LIST
+// #else
 	if (get_dirty_pages(mapping->host) <=
 				SM_I(F2FS_M_SB(mapping))->min_hot_blocks)
 		set_inode_flag(mapping->host, FI_HOT_DATA);
 	else
+// #endif
 		clear_inode_flag(mapping->host, FI_HOT_DATA);
 
 	if (wbc->range_cyclic) {
@@ -2990,6 +4050,14 @@ retry:
 				tag);
 		if (nr_pages == 0)
 			break;
+// #ifdef FG_PID_LIST
+// 		if (flag == 1){
+// 			// printk("nr_pages = %d\n",nr_pages);
+// 			flag = 0;
+// 			if (nr_pages <= 4)
+// 				io_type = APP_BUFFERED_IO;
+// 		}
+// #endif
 
 		for (i = 0; i < nr_pages; i++) {
 			struct page *page = pvec.pages[i];
@@ -3615,6 +4683,27 @@ static void f2fs_dio_submit_bio(struct bio *bio, struct inode *inode,
 	inc_page_count(F2FS_I_SB(inode),
 			write ? F2FS_DIO_WRITE : F2FS_DIO_READ);
 
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+		if(F2FS_OPTION(F2FS_I_SB(inode)).cwj_pi && !is_read_io(bio_op(bio)))
+		{
+			if(!cwj_bio_integrity_prep(bio))
+			// if(!bio_integrity_prep(bio))
+			{
+				printk(KERN_INFO "--------cwj-绑定bip失败--------\n");
+				return;
+			}
+			bio->is_cwj_pi=0;
+			// printk(KERN_INFO "--------cwj-绑定bip成功--------\n");
+			// printk(KERN_INFO "--------cwj-获取bip--------\n");
+			// struct bio_integrity_payload *bip;
+			// bip=bio_integrity(bio);
+			// printk(KERN_INFO "--------cwj-打印bip内容--------\n");
+			// struct cwj_pi_tuple *pi = bvec_virt(bip->bip_vec);
+			// printk(KERN_INFO "write: bip->bip_vec:\npi->i_ino=%llu\n,pi->index=%llu\n",pi->i_ino,pi->index);
+			// printk(KERN_INFO "bip->bip_inline_vecs=%d",bip->bip_inline_vecs);
+		}
+#endif
+
 	submit_bio(bio);
 	return;
 out:
@@ -4201,6 +5290,60 @@ fail_free_cache:
 fail:
 	return -ENOMEM;
 }
+
+#ifdef CONFIG_BLK_DEV_ZONED
+int __init f2fs_init_post_write_end_io_processing(void)
+{
+	bio_post_write_end_io_ctx_cache =
+		kmem_cache_create("f2fs_bio_post_write_end_io_ctx",
+				  sizeof(struct bio_post_write_end_io_ctx), 0, 0, NULL);
+	if (!bio_post_write_end_io_ctx_cache)
+		goto fail;
+	bio_post_write_end_io_ctx_pool =
+		mempool_create_slab_pool(NUM_PREALLOC_POST_WRITE_END_IO_CTXS,
+					 bio_post_write_end_io_ctx_cache);
+	if (!bio_post_write_end_io_ctx_pool)
+		goto fail_free_cache;
+	zone_append_entry_slab = f2fs_kmem_cache_create("f2fs_zone_append_entry",
+			sizeof(struct zone_append_entry));
+	if (!zone_append_entry_slab)
+		goto destroy_bio_post_write_end_io_ctx_pool;
+	return 0;
+
+destroy_bio_post_write_end_io_ctx_pool:
+	mempool_destroy(bio_post_write_end_io_ctx_pool);
+fail_free_cache:
+	kmem_cache_destroy(bio_post_write_end_io_ctx_cache);
+fail:
+	return -ENOMEM;
+}
+
+void f2fs_destroy_post_write_end_io_processing(void)
+{
+	kmem_cache_destroy(zone_append_entry_slab);
+	mempool_destroy(bio_post_write_end_io_ctx_pool);
+	kmem_cache_destroy(bio_post_write_end_io_ctx_cache);
+}
+
+int f2fs_init_post_write_end_io_wq(struct f2fs_sb_info *sbi)
+{
+	// if (!f2fs_sb_has_encrypt(sbi) &&
+	// 	!f2fs_sb_has_verity(sbi) &&
+	// 	!f2fs_sb_has_compression(sbi))
+	// 	return 0;
+
+	sbi->post_write_end_io_wq = alloc_workqueue("f2fs_post_write_end_io_wq",
+						 WQ_UNBOUND | WQ_HIGHPRI,
+						 num_online_cpus());
+	return sbi->post_write_end_io_wq ? 0 : -ENOMEM;
+}
+
+void f2fs_destroy_post_write_end_io_wq(struct f2fs_sb_info *sbi)
+{
+	if (sbi->post_write_end_io_wq)
+		destroy_workqueue(sbi->post_write_end_io_wq);
+}
+#endif
 
 void f2fs_destroy_post_read_processing(void)
 {

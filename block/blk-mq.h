@@ -113,7 +113,9 @@ static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
 	 */
 	if (flags & REQ_HIPRI)
 		type = HCTX_TYPE_POLL;
-	else if ((flags & REQ_OP_MASK) == REQ_OP_READ)
+	else if (blk_queue_is_zoned(q) && (flags & REQ_FG_APP_IO))//FG - BG
+		type = HCTX_TYPE_READ;
+	else if (!blk_queue_is_zoned(q) && ((flags & REQ_OP_MASK) == REQ_OP_READ))//FG - BG
 		type = HCTX_TYPE_READ;
 	
 	return ctx->hctxs[type];

@@ -336,6 +336,17 @@ static struct request *deadline_skip_seq_writes(struct deadline_data *dd,
 }
 
 /*
+ * Use write locking if either QUEUE_FLAG_NO_ZONE_WRITE_LOCK or
+ * REQ_NO_ZONE_WRITE_LOCK has not been set. Not using zone write locking is
+ * only safe if the submitter allocates and submit requests in LBA order per
+ * zone and if the block driver preserves the request order.
+ */
+static bool dd_use_write_locking(struct request *rq)/* unlock FG - BG */
+{
+	return blk_queue_is_zoned(rq->q) && !blk_no_zone_write_lock(rq);
+}
+
+/*
  * For the specified data direction, return the next request to
  * dispatch using arrival ordered lists.
  */
@@ -350,7 +361,7 @@ deadline_fifo_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 		return NULL;
 
 	rq = rq_entry_fifo(per_prio->fifo_list[data_dir].next);
-	if (data_dir == DD_READ || !blk_queue_is_zoned(rq->q))
+	if (data_dir == DD_READ || !dd_use_write_locking(rq))/* unlock FG - BG */
 		return rq;
 
 	/*
@@ -389,7 +400,7 @@ deadline_next_request(struct deadline_data *dd, struct dd_per_prio *per_prio,
 	if (!rq)
 		return NULL;
 
-	if (data_dir == DD_READ || !blk_queue_is_zoned(rq->q))
+	if (data_dir == DD_READ || !dd_use_write_locking(rq))/* unlock FG - BG */
 		return rq;
 
 	/*
@@ -519,7 +530,8 @@ done:
 	/*
 	 * If the request needs its target zone locked, do it.
 	 */
-	blk_req_zone_write_lock(rq);
+	if (dd_use_write_locking(rq))/* unlock FG - BG */
+		blk_req_zone_write_lock(rq);
 	rq->rq_flags |= RQF_STARTED;
 	return rq;
 }
@@ -835,7 +847,7 @@ static void dd_finish_request(struct request *rq)
 	if (rq->elv.priv[0])
 		dd_count(dd, completed, prio);
 
-	if (blk_queue_is_zoned(q)) {
+	if (dd_use_write_locking(rq)) {/* unlock FG - BG */
 		unsigned long flags;
 
 		spin_lock_irqsave(&dd->zone_lock, flags);

@@ -3366,7 +3366,11 @@ static int __get_segment_type_6(struct f2fs_io_info *fio)
 	}
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+int __get_segment_type(struct f2fs_io_info *fio)
+#else
 static int __get_segment_type(struct f2fs_io_info *fio)
+#endif
 {
 	int type = 0;
 
@@ -3490,6 +3494,104 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	up_read(&SM_I(sbi)->curseg_lock);
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+static void f2fs_allocate_data_block_zone_append(struct f2fs_sb_info *sbi, struct page *page,
+		block_t old_blkaddr, block_t *new_blkaddr, block_t *zone_pointer,
+		struct f2fs_summary *sum, int type,
+		struct f2fs_io_info *fio)
+{
+	struct sit_info *sit_i = SIT_I(sbi);
+	struct curseg_info *curseg = CURSEG_I(sbi, type);
+	unsigned long long old_mtime;
+	unsigned int secno, start_segno;
+
+	down_read(&SM_I(sbi)->curseg_lock);
+
+	mutex_lock(&curseg->curseg_mutex);
+	down_write(&sit_i->sentry_lock);
+
+	secno = GET_SEC_FROM_SEG(sbi, curseg->segno);
+	start_segno = GET_SEG_FROM_SEC(sbi, secno);
+
+	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
+
+	f2fs_bug_on(sbi, curseg->next_blkoff >= sbi->blocks_per_seg);
+
+	f2fs_wait_discard_bio(sbi, *new_blkaddr);
+
+	/*
+	 * __add_sum_entry should be resided under the curseg_mutex
+	 * because, this function updates a summary entry in the
+	 * current summary block.
+	 */
+	// __add_sum_entry(sbi, type, sum);
+
+	__refresh_next_blkoff(sbi, curseg);
+
+	stat_inc_block_count(sbi, curseg);
+
+	update_segment_mtime(sbi, old_blkaddr, 0);
+	old_mtime = 0;
+
+	update_segment_mtime(sbi, *new_blkaddr, old_mtime);
+
+	/*
+	 * SIT information should be updated before segment allocation,
+	 * since SSR needs latest valid block information.
+	 */
+	update_sit_entry(sbi, *new_blkaddr, 1);
+	if (GET_SEGNO(sbi, old_blkaddr) != NULL_SEGNO)
+		update_sit_entry(sbi, old_blkaddr, -1);
+
+	/*
+	 * If the current segment is full, flush it out and replace it with a
+	 * new segment.
+	 */
+	if (!__has_curseg_space(sbi, curseg)) {
+		// if (from_gc)
+		// 	get_atssr_segment(sbi, type, se->type,
+		// 				AT_SSR, se->mtime);
+		// else
+		sit_i->s_ops->allocate_segment(sbi, type, false);
+	}
+	/*
+	 * segment dirty status should be updated after segment allocation,
+	 * so we just need to update status only one time after previous
+	 * segment being closed.
+	 */
+	locate_dirty_segment(sbi, GET_SEGNO(sbi, old_blkaddr));
+	locate_dirty_segment(sbi, GET_SEGNO(sbi, *new_blkaddr));
+
+	up_write(&sit_i->sentry_lock);
+
+	// if (page && IS_NODESEG(type)) {
+	// 	fill_node_footer_blkaddr(page, NEXT_FREE_BLKADDR(sbi, curseg));
+
+	// 	f2fs_inode_chksum_set(sbi, page);
+	// }
+	*zone_pointer = *new_blkaddr;
+	*new_blkaddr = START_BLOCK(sbi, start_segno);
+
+	if (fio) {
+		struct f2fs_bio_info *io;
+
+		if (F2FS_IO_ALIGNED(sbi))
+			fio->retry = 0;
+
+		INIT_LIST_HEAD(&fio->list);
+		fio->in_list = true;
+		io = sbi->write_io[fio->type] + fio->temp;
+		spin_lock(&io->io_lock);
+		list_add_tail(&fio->list, &io->io_list);
+		spin_unlock(&io->io_lock);
+	}
+
+	mutex_unlock(&curseg->curseg_mutex);
+
+	up_read(&SM_I(sbi)->curseg_lock);
+}
+#endif
+
 static void update_device_state(struct f2fs_io_info *fio)
 {
 	struct f2fs_sb_info *sbi = fio->sbi;
@@ -3540,6 +3642,39 @@ reallocate:
 		up_read(&fio->sbi->io_order_lock);
 }
 
+#ifdef CONFIG_BLK_DEV_ZONED
+static void do_write_page_zone_append(struct f2fs_summary *sum, struct f2fs_io_info *fio, struct page *ipage)
+{
+	int type = __get_segment_type(fio);
+	bool keep_order = (f2fs_lfs_mode(fio->sbi) && type == CURSEG_COLD_DATA);
+
+	fio->op = REQ_OP_ZONE_APPEND;
+
+	if (keep_order)
+		down_read(&fio->sbi->io_order_lock);
+reallocate:
+	f2fs_allocate_data_block_zone_append(fio->sbi, fio->page, fio->old_blkaddr,
+			&fio->new_blkaddr, &fio->zone_pointer, sum, type, fio);
+	if (GET_SEGNO(fio->sbi, fio->old_blkaddr) != NULL_SEGNO) {
+		invalidate_mapping_pages(META_MAPPING(fio->sbi),
+					fio->old_blkaddr, fio->old_blkaddr);
+		f2fs_invalidate_compress_page(fio->sbi, fio->old_blkaddr);
+	}
+
+	/* writeout dirty page into bdev */
+	f2fs_submit_page_write_zone_append(fio, ipage, type);
+	if (fio->retry) {// FIX
+		fio->old_blkaddr = fio->zone_pointer;
+		goto reallocate;
+	}
+
+	update_device_state(fio);
+
+	if (keep_order)
+		up_read(&fio->sbi->io_order_lock);
+}
+#endif
+
 void f2fs_do_write_meta_page(struct f2fs_sb_info *sbi, struct page *page,
 					enum iostat_type io_type)
 {
@@ -3585,8 +3720,23 @@ void f2fs_outplace_write_data(struct dnode_of_data *dn,
 
 	f2fs_bug_on(sbi, dn->data_blkaddr == NULL_ADDR);
 	set_summary(&sum, dn->nid, dn->ofs_in_node, fio->version);
+
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (f2fs_sb_has_blkzoned(sbi) && (F2FS_OPTION(sbi).qwj_use_zone_append == true) && (fio->io_type != FS_GC_DATA_IO) && (__get_segment_type(fio) <= CURSEG_WARM_DATA)){
+	// if (false){
+		// if (test_opt(sbi, INLINE_XATTR) || test_opt(sbi, INLINE_DATA) || test_opt(sbi, INLINE_DENTRY)){
+		// 	printk("test_opt(sbi, INLINE_XATTR) || test_opt(sbi, INLINE_DATA) || test_opt(sbi, INLINE_DENTRY)\n");
+		// }
+		f2fs_add_zone_append_entry(fio->sbi, fio->page);
+		do_write_page_zone_append(&sum, fio, dn->inode_page);
+	}else{
+		do_write_page(&sum, fio);
+		f2fs_update_data_blkaddr(dn, fio->new_blkaddr);
+	}
+#else
 	do_write_page(&sum, fio);
 	f2fs_update_data_blkaddr(dn, fio->new_blkaddr);
+#endif
 
 	f2fs_update_iostat(sbi, fio->io_type, F2FS_BLKSIZE);
 }

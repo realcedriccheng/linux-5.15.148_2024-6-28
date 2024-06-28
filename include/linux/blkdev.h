@@ -251,7 +251,7 @@ static inline bool blk_op_is_passthrough(unsigned int op)
 
 static inline bool blk_rq_is_passthrough(struct request *rq)
 {
-	return blk_op_is_passthrough(req_op(rq));
+	return blk_op_is_passthrough(req_op(rq)) || (rq->cmd_flags & REQ_FG_APP_IO);//FG - BG
 }
 
 static inline unsigned short req_get_ioprio(struct request *req)
@@ -592,6 +592,7 @@ struct request_queue {
 #define QUEUE_FLAG_RQ_ALLOC_TIME 27	/* record rq->alloc_time_ns */
 #define QUEUE_FLAG_HCTX_ACTIVE	28	/* at least one blk-mq hctx is active */
 #define QUEUE_FLAG_NOWAIT       29	/* device supports NOWAIT */
+#define QUEUE_FLAG_NO_ZONE_WRITE_LOCK 30 /* unlock FG - BG */
 
 #define QUEUE_FLAG_MQ_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
 				 (1 << QUEUE_FLAG_SAME_COMP) |		\
@@ -638,6 +639,11 @@ bool blk_queue_flag_test_and_set(unsigned int flag, struct request_queue *q);
 #define blk_queue_fua(q)	test_bit(QUEUE_FLAG_FUA, &(q)->queue_flags)
 #define blk_queue_registered(q)	test_bit(QUEUE_FLAG_REGISTERED, &(q)->queue_flags)
 #define blk_queue_nowait(q)	test_bit(QUEUE_FLAG_NOWAIT, &(q)->queue_flags)
+
+static inline bool blk_queue_no_zone_write_lock(struct request_queue *q)/* unlock FG - BG */
+{
+	return test_bit(QUEUE_FLAG_NO_ZONE_WRITE_LOCK, &q->queue_flags);
+}
 
 extern void blk_set_pm_only(struct request_queue *q);
 extern void blk_clear_pm_only(struct request_queue *q);
@@ -1887,6 +1893,7 @@ extern int bdev_write_page(struct block_device *, sector_t, struct page *,
 						struct writeback_control *);
 
 #ifdef CONFIG_BLK_DEV_ZONED
+bool blk_no_zone_write_lock(struct request *rq);/* unlock FG - BG */
 bool blk_req_needs_zone_write_lock(struct request *rq);
 bool blk_req_zone_write_trylock(struct request *rq);
 void __blk_req_zone_write_lock(struct request *rq);
@@ -1917,6 +1924,11 @@ static inline bool blk_req_can_dispatch_to_zone(struct request *rq)
 	return !blk_req_zone_is_write_locked(rq);
 }
 #else
+static inline bool blk_no_zone_write_lock(struct request *rq)/* unlock FG - BG */
+{
+	return true;
+}
+
 static inline bool blk_req_needs_zone_write_lock(struct request *rq)
 {
 	return false;

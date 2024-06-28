@@ -267,6 +267,8 @@ struct bio {
 
 	struct bio_set		*bi_pool;
 
+	unsigned short is_cwj_pi;//cwj_oob
+
 	/*
 	 * We can inline a number of vecs at the end of the bio, to avoid
 	 * double allocations for a small number of bio_vecs. This member
@@ -371,6 +373,8 @@ enum req_flag_bits {
 	__REQ_PREFLUSH,		/* request for cache flush */
 	__REQ_RAHEAD,		/* read ahead, can fail anytime */
 	__REQ_BACKGROUND,	/* background IO */
+	__REQ_FG_APP_IO,	/* foreground app IO FG - BG */
+	__REQ_NO_ZONE_WRITE_LOCK, /* unlock FG - BG */
 	__REQ_NOWAIT,           /* Don't wait if request will block */
 	/*
 	 * When a shared kthread needs to issue a bio for a cgroup, doing
@@ -405,6 +409,8 @@ enum req_flag_bits {
 #define REQ_PREFLUSH		(1ULL << __REQ_PREFLUSH)
 #define REQ_RAHEAD		(1ULL << __REQ_RAHEAD)
 #define REQ_BACKGROUND		(1ULL << __REQ_BACKGROUND)
+#define REQ_FG_APP_IO		(1ULL << __REQ_FG_APP_IO) /* foreground app IO FG - BG */
+#define REQ_NO_ZONE_WRITE_LOCK	(1ULL << __REQ_NO_ZONE_WRITE_LOCK) /* unlock FG - BG */
 #define REQ_NOWAIT		(1ULL << __REQ_NOWAIT)
 #define REQ_CGROUP_PUNT		(1ULL << __REQ_CGROUP_PUNT)
 

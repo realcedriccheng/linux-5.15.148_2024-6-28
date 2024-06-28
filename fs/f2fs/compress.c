@@ -1355,6 +1355,9 @@ static int f2fs_write_compressed_pages(struct compress_ctx *cc,
 			fio.compressed_page = cc->cpages[i - 1];
 
 		cc->cpages[i - 1] = NULL;
+		if (f2fs_sb_has_blkzoned(sbi) && (F2FS_OPTION(sbi).qwj_use_zone_append == true) && (fio.io_type != FS_GC_DATA_IO) && (__get_segment_type(&fio) <= CURSEG_WARM_DATA)){
+			f2fs_bug_on(sbi, 1);
+		}
 		f2fs_outplace_write_data(&dn, &fio);
 		(*submitted)++;
 unlock_continue:

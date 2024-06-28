@@ -15,6 +15,25 @@
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
 
+// #define PREALLOC_SPACE
+#define ZNS_FTL
+#define CONV_FTL
+// #define SLC_CACHE
+
+#define USER_SET_LAT
+
+#ifdef ZNS_FTL
+#ifndef MUST_USE
+#define MUST_USE
+#endif
+#endif
+
+#ifdef CONV_FTL
+#ifndef MUST_USE
+#define MUST_USE
+#endif
+#endif
+
 struct nullb_cmd {
 	struct request *rq;
 	struct bio *bio;
@@ -23,6 +42,15 @@ struct nullb_cmd {
 	struct nullb_queue *nq;
 	struct hrtimer timer;
 	bool fake_timeout;
+	unsigned int queue_id;
+#ifdef MUST_USE
+	uint64_t nsecs_start;
+	uint64_t nsecs_target;
+#ifdef SLC_CACHE
+	uint64_t nsecs_start_slc;
+	int zno_map;
+#endif
+#endif	
 };
 
 struct nullb_queue {
@@ -31,6 +59,7 @@ struct nullb_queue {
 	unsigned int queue_depth;
 	struct nullb_device *dev;
 	unsigned int requeue_selection;
+	unsigned int queue_id;//FG - BG
 
 	struct nullb_cmd *cmds;
 };
@@ -51,6 +80,9 @@ struct nullb_zone {
 	enum blk_zone_cond cond;
 	sector_t start;
 	sector_t wp;
+#ifdef SLC_CACHE
+	sector_t wp_tlc;
+#endif
 	unsigned int len;
 	unsigned int capacity;
 };
@@ -76,6 +108,11 @@ struct nullb_device {
 
 	unsigned long size; /* device size in MB */
 	unsigned long completion_nsec; /* time in ns to complete a request */
+#ifdef USER_SET_LAT
+	unsigned long read_nsec; /* time in ns to complete a read NAND request */
+	unsigned long write_nsec; /* time in ns to complete a write NAND request */
+	unsigned long erase_nsec; /* time in ns to complete a erase NAND request */
+#endif
 	unsigned long cache_size; /* disk cache size in MB */
 	unsigned long zone_size; /* zone size in MB if device is zoned */
 	unsigned long zone_capacity; /* zone capacity in MB if device is zoned */
@@ -97,7 +134,29 @@ struct nullb_device {
 	bool memory_backed; /* if data is stored in memory */
 	bool discard; /* if support discard */
 	bool zoned; /* if device is zoned */
+	bool no_zone_write_lock;/* unlock FG - BG */
 	bool virt_boundary; /* virtual boundary on/off for the device */
+
+	bool zufs;	/* if device is zufs */
+	bool ufs;	/* if device is ufs */
+	unsigned long map_entry_nr_per_pg;
+	unsigned long ufs_op_area_pcent;
+#ifdef SLC_CACHE
+	unsigned long slc_zone_number;
+#endif
+
+	unsigned long gc_calls;//for gc count
+	unsigned long gc_move_pages;//for gc count
+
+#ifdef ZNS_FTL
+	struct zns_ftl *zns_ftl;
+#endif
+#ifdef CONV_FTL
+	struct conv_ftl *conv_ftls;
+#endif
+#ifdef SLC_CACHE
+	struct slc_cache *slc_cache;
+#endif
 };
 
 struct nullb {
@@ -124,6 +183,14 @@ blk_status_t null_handle_discard(struct nullb_device *dev, sector_t sector,
 blk_status_t null_process_cmd(struct nullb_cmd *cmd,
 			      enum req_opf op, sector_t sector,
 			      unsigned int nr_sectors);
+#ifdef SLC_CACHE
+void null_cmd_end_timer(struct nullb_cmd *cmd);
+enum hrtimer_restart null_cmd_timer_expired_slc(struct hrtimer *timer);
+inline void null_lock_zone(struct nullb_device *dev,
+				  struct nullb_zone *zone);
+inline void null_unlock_zone(struct nullb_device *dev,
+				    struct nullb_zone *zone);
+#endif
 
 #ifdef CONFIG_BLK_DEV_ZONED
 int null_init_zoned_dev(struct nullb_device *dev, struct request_queue *q);

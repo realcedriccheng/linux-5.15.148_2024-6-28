@@ -1249,6 +1249,12 @@ retry_flush_dents:
 		goto retry_flush_quotas;
 	}
 
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (F2FS_OPTION(sbi).qwj_use_zone_append == true){
+		f2fs_submit_merged_write(sbi, DATA);
+		f2fs_wait_on_zone_append_pages_writeback(sbi, 0);
+	}
+#endif
 	/*
 	 * POR: we should ensure that there are no dirty node pages
 	 * until finishing nat/sit flush. inode->i_blocks can be updated.
@@ -1599,6 +1605,12 @@ static int do_checkpoint(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 	f2fs_release_ino_entry(sbi, false);
 
 	f2fs_reset_fsync_node_info(sbi);
+
+#ifdef CONFIG_BLK_DEV_ZONED
+	if (F2FS_OPTION(sbi).qwj_use_zone_append == true){
+		f2fs_reset_zone_append_info(sbi);
+	}
+#endif
 
 	clear_sbi_flag(sbi, SBI_IS_DIRTY);
 	clear_sbi_flag(sbi, SBI_NEED_CP);

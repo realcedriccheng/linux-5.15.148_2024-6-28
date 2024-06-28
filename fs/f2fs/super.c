@@ -27,6 +27,10 @@
 #include <linux/part_stat.h>
 #include <linux/zstd.h>
 #include <linux/lz4.h>
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+// #include <linux/blk-integrity.h>
+#include <linux/cwj_integrity.h>
+#endif
 
 #include "f2fs.h"
 #include "node.h"
@@ -159,6 +163,13 @@ enum {
 	Opt_gc_merge,
 	Opt_nogc_merge,
 	Opt_discard_unit,
+	Opt_qwj_no_fsync,
+	Opt_qwj_buffer_io,
+	Opt_qwj_use_zone_append,
+	Opt_qwj_flush_buffer_io,
+	Opt_qwj_fg_app_io,// FG - BG
+	Opt_qwj_no_zone_write_lock,// FG - BG
+	Opt_cwj_pi,
 	Opt_err,
 };
 
@@ -236,6 +247,13 @@ static match_table_t f2fs_tokens = {
 	{Opt_gc_merge, "gc_merge"},
 	{Opt_nogc_merge, "nogc_merge"},
 	{Opt_discard_unit, "discard_unit=%s"},
+	{Opt_qwj_no_fsync, "qwj_no_fsync"},
+	{Opt_qwj_buffer_io, "qwj_buffer_io"},
+	{Opt_qwj_use_zone_append, "qwj_use_zone_append"},
+	{Opt_qwj_flush_buffer_io, "qwj_flush_buffer_io"},
+	{Opt_qwj_fg_app_io, "qwj_fg_app_io"},// FG - BG
+	{Opt_qwj_no_zone_write_lock, "qwj_no_zone_write_lock"},// FG - BG
+	{Opt_cwj_pi, "cwj_pi"},
 	{Opt_err, NULL},
 };
 
@@ -698,6 +716,28 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 		token = match_token(p, f2fs_tokens, args);
 
 		switch (token) {
+		case Opt_qwj_no_fsync:
+			F2FS_OPTION(sbi).qwj_no_fsync = true;
+			break;
+		case Opt_qwj_buffer_io:
+			F2FS_OPTION(sbi).qwj_buffer_io = true;
+			break;
+		case Opt_qwj_use_zone_append:
+			F2FS_OPTION(sbi).qwj_use_zone_append = true;
+			break;
+		case Opt_cwj_pi:
+			F2FS_OPTION(sbi).cwj_pi=true;
+			printk("开启cwj_pi\n");
+			break;
+		case Opt_qwj_flush_buffer_io:
+			F2FS_OPTION(sbi).qwj_flush_buffer_io=true;
+			break;
+		case Opt_qwj_fg_app_io:// FG - BG
+			F2FS_OPTION(sbi).qwj_fg_app_io=true;
+			break;
+		case Opt_qwj_no_zone_write_lock:// FG - BG
+			F2FS_OPTION(sbi).qwj_no_zone_write_lock=true;
+			break;
 		case Opt_gc_background:
 			name = match_strdup(&args[0]);
 
@@ -1544,7 +1584,48 @@ static void destroy_device_list(struct f2fs_sb_info *sbi)
 {
 	int i;
 
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+	printk("设备数s_ndevs=%d\n",sbi->s_ndevs);
+	//单个设备
+	if(F2FS_OPTION(sbi).cwj_pi && bdev_get_integrity(sbi->sb->s_bdev))
+	{
+		struct blk_integrity integrity = { };
+		integrity.profile = NULL;
+		integrity.tuple_size = 8;
+		blk_integrity_register(sbi->sb->s_bdev->bd_disk, &integrity);
+		printk("注销成功\n");
+	}
+#endif
+	//多个设备
 	for (i = 0; i < sbi->s_ndevs; i++) {
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+		//注销
+		if(F2FS_OPTION(sbi).cwj_pi && bdev_get_integrity(FDEV(i).bdev)){
+			struct blk_integrity integrity = { };
+			f2fs_info(sbi, "注销设备 [%2d]: %20s, %8u, %8x - %8x (zone: %s)",
+				i, FDEV(i).path,
+				FDEV(i).total_segments,
+				FDEV(i).start_blk, FDEV(i).end_blk,
+				bdev_zoned_model(FDEV(i).bdev) == BLK_ZONED_HA ?
+				"Host-aware" : "Host-managed");
+
+			// blk_integrity_unregister(FDEV(i).bdev->bd_disk);
+			integrity.profile = NULL;
+			integrity.tuple_size = 8;
+			blk_integrity_register(FDEV(i).bdev->bd_disk, &integrity);
+			printk("注销成功\n");
+			// blk_queue_max_integrity_segments(disk->queue, max_integrity_segments);
+
+			// if(bdev_get_integrity(FDEV(i).bdev)!=NULL)
+			// {
+			// 	printk("注销失败\n");
+			// }
+			// else
+			// {
+			// 	printk("注销成功\n");
+			// }
+		}
+#endif
 		blkdev_put(FDEV(i).bdev, FMODE_EXCL);
 #ifdef CONFIG_BLK_DEV_ZONED
 		kvfree(FDEV(i).blkz_seq);
@@ -1632,6 +1713,10 @@ static void f2fs_put_super(struct super_block *sb)
 	f2fs_destroy_segment_manager(sbi);
 
 	f2fs_destroy_post_read_wq(sbi);
+
+#ifdef CONFIG_BLK_DEV_ZONED
+	f2fs_destroy_post_write_end_io_wq(sbi);
+#endif
 
 	kvfree(sbi->ckpt);
 
@@ -1910,6 +1995,22 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 	else if (F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_OFF)
 		seq_printf(seq, ",background_gc=%s", "off");
 
+	if (F2FS_OPTION(sbi).qwj_no_fsync == true)
+		seq_printf(seq, ",qwj_no_fsync");
+	if (F2FS_OPTION(sbi).qwj_buffer_io == true)
+		seq_printf(seq, ",qwj_buffer_io");
+	if (F2FS_OPTION(sbi).qwj_use_zone_append == true)
+		seq_printf(seq, ",qwj_use_zone_append");
+	if (F2FS_OPTION(sbi).qwj_flush_buffer_io == true)
+		seq_printf(seq, ",qwj_flush_buffer_io");
+	if (F2FS_OPTION(sbi).qwj_fg_app_io == true)// FG - BG
+		seq_printf(seq, ",qwj_fg_app_io");
+	if (F2FS_OPTION(sbi).qwj_no_zone_write_lock == true)// FG - BG
+		seq_printf(seq, ",qwj_no_zone_write_lock");
+
+	if (F2FS_OPTION(sbi).cwj_pi == true)
+		seq_printf(seq, ",cwj_pi");
+
 	if (test_opt(sbi, GC_MERGE))
 		seq_puts(seq, ",gc_merge");
 
@@ -2067,12 +2168,24 @@ static void default_options(struct f2fs_sb_info *sbi)
 	F2FS_OPTION(sbi).compress_ext_cnt = 0;
 	F2FS_OPTION(sbi).compress_mode = COMPR_MODE_FS;
 	F2FS_OPTION(sbi).bggc_mode = BGGC_MODE_ON;
+	F2FS_OPTION(sbi).qwj_no_fsync = false;
+	F2FS_OPTION(sbi).qwj_buffer_io = false;
+	F2FS_OPTION(sbi).qwj_use_zone_append = false;
+	F2FS_OPTION(sbi).qwj_flush_buffer_io = false;
+	F2FS_OPTION(sbi).qwj_fg_app_io = false;// FG - BG
+	F2FS_OPTION(sbi).qwj_no_zone_write_lock = false;// FG - BG
+
+	F2FS_OPTION(sbi).cwj_pi = false;
 
 	sbi->sb->s_flags &= ~SB_INLINECRYPT;
 
 	set_opt(sbi, INLINE_XATTR);
-	set_opt(sbi, INLINE_DATA);
-	set_opt(sbi, INLINE_DENTRY);
+	if (!f2fs_sb_has_blkzoned(sbi)){
+		set_opt(sbi, INLINE_DATA);
+		set_opt(sbi, INLINE_DENTRY);
+	}else{
+		F2FS_OPTION(sbi).compress_mode = COMPR_MODE_USER;
+	}
 	set_opt(sbi, EXTENT_CACHE);
 	set_opt(sbi, NOHEAP);
 	clear_opt(sbi, DISABLE_CHECKPOINT);
@@ -3699,6 +3812,16 @@ static int init_blkz_info(struct f2fs_sb_info *sbi, int devi)
 	if (!f2fs_sb_has_blkzoned(sbi))
 		return 0;
 
+	sbi->max_active_zones = bdev_max_active_zones(bdev);
+	f2fs_err(sbi, "sbi->max_active_zones = %u\n", sbi->max_active_zones);
+	if (sbi->max_active_zones && (sbi->max_active_zones < F2FS_OPTION(sbi).active_logs)) {
+		f2fs_err(sbi,
+			"zoned: max active zones %u is too small, need at least %u active zones",
+				 sbi->max_active_zones, F2FS_OPTION(sbi).active_logs);
+		return -EINVAL;
+	}
+	atomic_set(&sbi->available_active_zones, sbi->max_active_zones - F2FS_OPTION(sbi).active_logs);
+
 	if (sbi->blocks_per_blkz && sbi->blocks_per_blkz !=
 				SECTOR_TO_BLOCK(bdev_zone_sectors(bdev)))
 		return -EINVAL;
@@ -3827,6 +3950,20 @@ int f2fs_commit_super(struct f2fs_sb_info *sbi, bool recover)
 	return err;
 }
 
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+void cwj_integrity_set(struct gendisk *disk)
+{
+	struct blk_integrity bi;
+	memset(&bi, 0, sizeof(bi));
+	bi.profile = &cwj_reverse_mapping;
+	bi.tuple_size=sizeof(struct cwj_pi_tuple);
+	bi.tag_size=bi.tuple_size;
+	bi.interval_exp = ilog2(queue_logical_block_size(disk->queue));
+	printk("->cwj_integrity_set\n");
+	blk_integrity_register(disk, &bi);
+}
+#endif
+
 static int f2fs_scan_devices(struct f2fs_sb_info *sbi)
 {
 	struct f2fs_super_block *raw_super = F2FS_RAW_SUPER(sbi);
@@ -3835,6 +3972,15 @@ static int f2fs_scan_devices(struct f2fs_sb_info *sbi)
 
 	/* Initialize single device information */
 	if (!RDEV(0).path[0]) {
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+		if(F2FS_OPTION(sbi).cwj_pi)
+		{
+			printk("----register pi\n");
+			cwj_integrity_set(sbi->sb->s_bdev->bd_disk);
+			printk("bi->profile->name:%s\n",(sbi->sb->s_bdev->bd_disk->queue->integrity).profile->name);
+			printk("----register end pi\n");
+		}
+#endif
 		if (!bdev_is_zoned(sbi->sb->s_bdev))
 			return 0;
 		max_devices = 1;
@@ -3850,6 +3996,13 @@ static int f2fs_scan_devices(struct f2fs_sb_info *sbi)
 				 GFP_KERNEL);
 	if (!sbi->devs)
 		return -ENOMEM;
+
+#ifdef FG_PID_LIST
+	for (i = 0; i < 3; i++) {
+		sbi->fg_app_list[i] = 0;
+	}
+	init_rwsem(&sbi->fg_app_list_lock);
+#endif
 
 	for (i = 0; i < max_devices; i++) {
 
@@ -3886,6 +4039,15 @@ static int f2fs_scan_devices(struct f2fs_sb_info *sbi)
 
 		/* to release errored devices */
 		sbi->s_ndevs = i + 1;
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+		if(F2FS_OPTION(sbi).cwj_pi && FDEV(i).bdev)
+		{
+			printk("----register pi\n");
+			cwj_integrity_set(FDEV(i).bdev->bd_disk);
+			printk("bi->profile->name:%s\n",(FDEV(i).bdev->bd_disk->queue->integrity).profile->name);
+			printk("----register end pi\n");
+		}
+#endif
 
 #ifdef CONFIG_BLK_DEV_ZONED
 		if (bdev_zoned_model(FDEV(i).bdev) == BLK_ZONED_HM &&
@@ -4110,6 +4272,11 @@ try_onemore:
 			INIT_LIST_HEAD(&sbi->write_io[i][j].io_list);
 			INIT_LIST_HEAD(&sbi->write_io[i][j].bio_list);
 			init_rwsem(&sbi->write_io[i][j].bio_list_lock);
+#ifdef CONFIG_BLK_DEV_ZONED
+			init_completion(&sbi->write_io[i][j].zone_wait);
+			sbi->write_io[i][j].zone_pending_bio = NULL;
+			sbi->write_io[i][j].bi_private = NULL;
+#endif
 		}
 	}
 
@@ -4179,6 +4346,15 @@ try_onemore:
 		f2fs_err(sbi, "Failed to initialize post read workqueue");
 		goto free_devices;
 	}
+
+#ifdef CONFIG_BLK_DEV_ZONED
+	err = f2fs_init_post_write_end_io_wq(sbi);
+	if (err) {
+		f2fs_err(sbi, "Failed to initialize post write_end_io workqueue");
+		goto free_devices;
+	}
+	f2fs_init_zone_append_info(sbi);
+#endif
 
 	sbi->total_valid_node_count =
 				le32_to_cpu(sbi->ckpt->valid_node_count);
@@ -4448,6 +4624,11 @@ free_sm:
 stop_ckpt_thread:
 	f2fs_stop_ckpt_thread(sbi);
 	f2fs_destroy_post_read_wq(sbi);
+
+#ifdef CONFIG_BLK_DEV_ZONED
+	f2fs_destroy_post_write_end_io_wq(sbi);
+#endif
+
 free_devices:
 	destroy_device_list(sbi);
 	kvfree(sbi->ckpt);
@@ -4607,6 +4788,11 @@ static int __init init_f2fs_fs(void)
 	err = f2fs_init_post_read_processing();
 	if (err)
 		goto free_root_stats;
+#ifdef CONFIG_BLK_DEV_ZONED
+	err = f2fs_init_post_write_end_io_processing();
+	if (err)
+		goto free_root_stats;
+#endif
 	err = f2fs_init_iostat_processing();
 	if (err)
 		goto free_post_read;
@@ -4638,6 +4824,9 @@ free_iostat:
 	f2fs_destroy_iostat_processing();
 free_post_read:
 	f2fs_destroy_post_read_processing();
+#ifdef CONFIG_BLK_DEV_ZONED
+	f2fs_destroy_post_write_end_io_processing();
+#endif
 free_root_stats:
 	f2fs_destroy_root_stats();
 	unregister_filesystem(&f2fs_fs_type);
@@ -4672,6 +4861,9 @@ static void __exit exit_f2fs_fs(void)
 	f2fs_destroy_bio_entry_cache();
 	f2fs_destroy_iostat_processing();
 	f2fs_destroy_post_read_processing();
+#ifdef CONFIG_BLK_DEV_ZONED
+	f2fs_destroy_post_write_end_io_processing();
+#endif
 	f2fs_destroy_root_stats();
 	unregister_filesystem(&f2fs_fs_type);
 	unregister_shrinker(&f2fs_shrinker_info);

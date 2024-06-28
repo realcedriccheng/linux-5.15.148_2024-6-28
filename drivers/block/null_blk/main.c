@@ -10,6 +10,12 @@
 #include <linux/fs.h>
 #include <linux/init.h>
 #include "null_blk.h"
+#include "zns_ftl.h"
+#include "conv_ftl.h"
+#include <linux/blkdev.h>
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+#include <linux/cwj_integrity.h>
+#endif
 
 #define FREE_BATCH		16
 
@@ -58,6 +64,10 @@ enum nullb_device_flags {
 struct nullb_page {
 	struct page *page;
 	DECLARE_BITMAP(bitmap, MAP_SZ);
+	//	cwj_pi_tuple
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+	struct cwj_pi_tuple cpt;
+#endif
 };
 #define NULLB_PAGE_LOCK (MAP_SZ - 1)
 #define NULLB_PAGE_FREE (MAP_SZ - 2)
@@ -88,7 +98,7 @@ static int g_no_sched;
 module_param_named(no_sched, g_no_sched, int, 0444);
 MODULE_PARM_DESC(no_sched, "No io scheduler");
 
-static int g_submit_queues = 1;
+static int g_submit_queues = 2;//FG - BG
 module_param_named(submit_queues, g_submit_queues, int, 0444);
 MODULE_PARM_DESC(submit_queues, "Number of submission queues");
 
@@ -192,6 +202,18 @@ static unsigned long g_completion_nsec = 10000;
 module_param_named(completion_nsec, g_completion_nsec, ulong, 0444);
 MODULE_PARM_DESC(completion_nsec, "Time in ns to complete a request in hardware. Default: 10,000ns");
 
+#ifdef USER_SET_LAT
+static unsigned long g_read_nsec = 44000;
+module_param_named(read_nsec, g_read_nsec, ulong, 0444);
+MODULE_PARM_DESC(read_nsec, "Time in ns to complete a read NAND request in hardware. Default: 44,000ns");
+static unsigned long g_write_nsec = 125000;
+module_param_named(write_nsec, g_write_nsec, ulong, 0444);
+MODULE_PARM_DESC(write_nsec, "Time in ns to complete a write NAND request in hardware. Default: 125,000ns");
+static unsigned long g_erase_nsec = 0;
+module_param_named(erase_nsec, g_erase_nsec, ulong, 0444);
+MODULE_PARM_DESC(erase_nsec, "Time in ns to complete a erase NAND request in hardware. Default: 0ns");
+#endif
+
 static int g_hw_queue_depth = 64;
 module_param_named(hw_queue_depth, g_hw_queue_depth, int, 0444);
 MODULE_PARM_DESC(hw_queue_depth, "Queue depth for each hardware queue. Default: 64");
@@ -203,6 +225,31 @@ MODULE_PARM_DESC(use_per_node_hctx, "Use per-node allocation for hardware contex
 static bool g_zoned;
 module_param_named(zoned, g_zoned, bool, S_IRUGO);
 MODULE_PARM_DESC(zoned, "Make device as a host-managed zoned block device. Default: false");
+
+static bool g_zufs;
+module_param_named(zufs, g_zufs, bool, S_IRUGO);
+MODULE_PARM_DESC(zufs, "Make device as a host-managed zufs device. Default: false");
+static bool g_ufs;
+module_param_named(ufs, g_ufs, bool, S_IRUGO);
+MODULE_PARM_DESC(ufs, "Make device as a ufs block device. Default: false");
+
+static bool g_no_zone_write_lock;// FG - BG
+module_param_named(no_zone_write_lock, g_no_zone_write_lock, bool, S_IRUGO);
+MODULE_PARM_DESC(no_zone_write_lock, "Make device as a no_zone_write_lock device. Default: yes");
+
+static unsigned long g_map_entry_nr_per_pg = 128;
+module_param_named(map_entry_nr_per_pg, g_map_entry_nr_per_pg, ulong, S_IRUGO);
+MODULE_PARM_DESC(map_entry_nr_per_pg, "Stored map entry number per page. Must be big than 0: Default: 128");
+
+static unsigned long g_ufs_op_area_pcent = 10;
+module_param_named(ufs_op_area_pcent, g_ufs_op_area_pcent, ulong, S_IRUGO);
+MODULE_PARM_DESC(ufs_op_area_pcent, "ufs op area pcent. Must used with ufs = 1: Default: 10");
+
+#ifdef SLC_CACHE
+static unsigned long g_slc_zone_number = 10;
+module_param_named(slc_zone_number, g_slc_zone_number, ulong, S_IRUGO);
+MODULE_PARM_DESC(slc_zone_number, "zufs slc zone number. Must >= 6: Default: 10");
+#endif
 
 static unsigned long g_zone_size = 256;
 module_param_named(zone_size, g_zone_size, ulong, S_IRUGO);
@@ -229,6 +276,11 @@ static void null_free_dev(struct nullb_device *dev);
 static void null_del_dev(struct nullb *nullb);
 static int null_add_dev(struct nullb_device *dev);
 static void null_free_device_storage(struct nullb_device *dev, bool is_cache);
+
+#ifdef PREALLOC_SPACE
+static int do_prealloc_space(struct nullb *nullb, u64 start_sector, u64 end_sector);
+static int prealloc_space_in_nullb(struct nullb_device *dev);
+#endif
 
 static inline struct nullb_device *to_nullb_device(struct config_item *item)
 {
@@ -346,6 +398,11 @@ static int nullb_apply_submit_queues(struct nullb_device *dev,
 
 NULLB_DEVICE_ATTR(size, ulong, NULL);
 NULLB_DEVICE_ATTR(completion_nsec, ulong, NULL);
+#ifdef USER_SET_LAT
+NULLB_DEVICE_ATTR(read_nsec, ulong, NULL);
+NULLB_DEVICE_ATTR(write_nsec, ulong, NULL);
+NULLB_DEVICE_ATTR(erase_nsec, ulong, NULL);
+#endif
 NULLB_DEVICE_ATTR(submit_queues, uint, nullb_apply_submit_queues);
 NULLB_DEVICE_ATTR(home_node, uint, NULL);
 NULLB_DEVICE_ATTR(queue_mode, uint, NULL);
@@ -361,12 +418,46 @@ NULLB_DEVICE_ATTR(discard, bool, NULL);
 NULLB_DEVICE_ATTR(mbps, uint, NULL);
 NULLB_DEVICE_ATTR(cache_size, ulong, NULL);
 NULLB_DEVICE_ATTR(zoned, bool, NULL);
+NULLB_DEVICE_ATTR(zufs, bool, NULL);
+NULLB_DEVICE_ATTR(ufs, bool, NULL);
+NULLB_DEVICE_ATTR(map_entry_nr_per_pg, ulong, NULL);
+NULLB_DEVICE_ATTR(ufs_op_area_pcent, ulong, NULL);
+#ifdef SLC_CACHE
+NULLB_DEVICE_ATTR(slc_zone_number, ulong, NULL);
+#endif
 NULLB_DEVICE_ATTR(zone_size, ulong, NULL);
 NULLB_DEVICE_ATTR(zone_capacity, ulong, NULL);
 NULLB_DEVICE_ATTR(zone_nr_conv, uint, NULL);
 NULLB_DEVICE_ATTR(zone_max_open, uint, NULL);
 NULLB_DEVICE_ATTR(zone_max_active, uint, NULL);
+NULLB_DEVICE_ATTR(no_zone_write_lock, bool, NULL);/* unlock FG - BG */
 NULLB_DEVICE_ATTR(virt_boundary, bool, NULL);
+
+static ssize_t nullb_device_gc_calls_show(struct config_item *item, char *page)//for gc count
+{
+	return nullb_device_ulong_attr_show(to_nullb_device(item)->gc_calls, page);
+}
+
+static ssize_t nullb_device_gc_calls_store(struct config_item *item,
+				     const char *page, size_t count)//for gc count
+{
+	return nullb_device_ulong_attr_store(&(to_nullb_device(item)->gc_calls), page, count);
+}
+
+CONFIGFS_ATTR(nullb_device_, gc_calls);//for gc count
+
+static ssize_t nullb_device_gc_move_pages_show(struct config_item *item, char *page)//for gc count
+{
+	return nullb_device_ulong_attr_show(to_nullb_device(item)->gc_move_pages, page);
+}
+
+static ssize_t nullb_device_gc_move_pages_store(struct config_item *item,
+				     const char *page, size_t count)//for gc count
+{
+	return nullb_device_ulong_attr_store(&(to_nullb_device(item)->gc_move_pages), page, count);
+}
+
+CONFIGFS_ATTR(nullb_device_, gc_move_pages);//for gc count
 
 static ssize_t nullb_device_power_show(struct config_item *item, char *page)
 {
@@ -392,6 +483,27 @@ static ssize_t nullb_device_power_store(struct config_item *item,
 			return -ENOMEM;
 		}
 
+#ifdef PREALLOC_SPACE
+		ret = prealloc_space_in_nullb(dev);
+		if (ret) {
+			pr_info("prealloc space fail !\n");
+			null_free_device_storage(dev, false);
+		}else{
+			pr_info("prealloc space success !\n");
+		}
+#endif
+#ifdef ZNS_FTL
+		if(dev->zoned && dev->zufs){
+			zns_init_namespace(dev, (dev->size * 1024 * 1024));
+			// printk("qwj-zns_init_namespace\n");
+		}
+#endif
+#ifdef CONV_FTL
+		if(dev->ufs){
+			conv_init_namespace(dev, (dev->size * 1024 * 1024));
+			// printk("qwj-conv_init_namespace\n");
+		}
+#endif
 		set_bit(NULLB_DEV_FL_CONFIGURED, &dev->flags);
 		dev->power = newp;
 	} else if (dev->power && !newp) {
@@ -465,6 +577,14 @@ CONFIGFS_ATTR(nullb_device_, badblocks);
 static struct configfs_attribute *nullb_device_attrs[] = {
 	&nullb_device_attr_size,
 	&nullb_device_attr_completion_nsec,
+#ifdef USER_SET_LAT
+	&nullb_device_attr_read_nsec,
+	&nullb_device_attr_write_nsec,
+	&nullb_device_attr_erase_nsec,
+#endif
+	&nullb_device_attr_gc_calls,//for gc count
+	&nullb_device_attr_gc_move_pages,//for gc count
+
 	&nullb_device_attr_submit_queues,
 	&nullb_device_attr_home_node,
 	&nullb_device_attr_queue_mode,
@@ -482,11 +602,19 @@ static struct configfs_attribute *nullb_device_attrs[] = {
 	&nullb_device_attr_cache_size,
 	&nullb_device_attr_badblocks,
 	&nullb_device_attr_zoned,
+	&nullb_device_attr_zufs,
+	&nullb_device_attr_ufs,
+	&nullb_device_attr_map_entry_nr_per_pg,
+	&nullb_device_attr_ufs_op_area_pcent,
+#ifdef SLC_CACHE
+	&nullb_device_attr_slc_zone_number,
+#endif
 	&nullb_device_attr_zone_size,
 	&nullb_device_attr_zone_capacity,
 	&nullb_device_attr_zone_nr_conv,
 	&nullb_device_attr_zone_max_open,
 	&nullb_device_attr_zone_max_active,
+	&nullb_device_attr_no_zone_write_lock,/* unlock FG - BG */
 	&nullb_device_attr_virt_boundary,
 	NULL,
 };
@@ -592,6 +720,11 @@ static struct nullb_device *null_alloc_dev(void)
 
 	dev->size = g_gb * 1024;
 	dev->completion_nsec = g_completion_nsec;
+#ifdef USER_SET_LAT
+	dev->read_nsec = g_read_nsec;
+	dev->write_nsec = g_write_nsec;
+	dev->erase_nsec = g_erase_nsec;
+#endif
 	dev->submit_queues = g_submit_queues;
 	dev->home_node = g_home_node;
 	dev->queue_mode = g_queue_mode;
@@ -602,6 +735,17 @@ static struct nullb_device *null_alloc_dev(void)
 	dev->blocking = g_blocking;
 	dev->use_per_node_hctx = g_use_per_node_hctx;
 	dev->zoned = g_zoned;
+	dev->zufs = g_zufs;
+	dev->ufs = g_ufs;
+	dev->map_entry_nr_per_pg = g_map_entry_nr_per_pg;
+	dev->ufs_op_area_pcent = g_ufs_op_area_pcent;
+#ifdef SLC_CACHE
+	dev->slc_zone_number = g_slc_zone_number;
+#endif
+	dev->gc_calls = 0;
+	dev->gc_move_pages = 0;
+
+	dev->no_zone_write_lock = g_no_zone_write_lock;// FG - BG
 	dev->zone_size = g_zone_size;
 	dev->zone_capacity = g_zone_capacity;
 	dev->zone_nr_conv = g_zone_nr_conv;
@@ -696,7 +840,26 @@ static struct nullb_cmd *alloc_cmd(struct nullb_queue *nq, int can_wait)
 static void end_cmd(struct nullb_cmd *cmd)
 {
 	int queue_mode = cmd->nq->dev->queue_mode;
+	// uint64_t nsecs_now = cpu_clock(1);
+	// if (nsecs_now > cmd->nsecs_start)
+	// 	printk("cmd total time: %llu\n",nsecs_now - cmd->nsecs_start);
+	// else
+	// 	printk("cmd total time: err!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
 
+#ifdef SLC_CACHE
+	if (cmd->zno_map != -1){
+		// unsigned long flags;
+		// spin_lock_irqsave(&slc_cache->write_lock, flags);
+		// cmd->nq->dev->slc_cache->slcp.zone_map[cmd->zno_map] = -1;
+		// cmd->nq->dev->slc_cache->slcp.active_zones--;
+		if (atomic_add_negative(-1, &cmd->nq->dev->slc_cache->slcp.active_zones)){
+			NVMEV_ASSERT(0);
+		}
+		cmd->zno_map = -1;
+		// spin_unlock_irqrestore(&slc_cache->write_lock, flags);
+	}
+#endif
+	
 	switch (queue_mode)  {
 	case NULL_Q_MQ:
 		blk_mq_end_request(cmd->rq, cmd->error);
@@ -710,6 +873,30 @@ static void end_cmd(struct nullb_cmd *cmd)
 	free_cmd(cmd);
 }
 
+#ifdef SLC_CACHE
+enum hrtimer_restart null_cmd_timer_expired_slc(struct hrtimer *timer)
+{
+	struct nullb_cmd *cmd;
+	cmd = container_of(timer, struct nullb_cmd, timer);
+
+	if (cmd->zno_map != -1){
+		// unsigned long flags;
+		// spin_lock_irqsave(&slc_cache->write_lock, flags);
+		// cmd->nq->dev->slc_cache->slcp.zone_map[cmd->zno_map] = -1;
+		// cmd->nq->dev->slc_cache->slcp.active_zones--;
+		if (atomic_add_negative(-1, &cmd->nq->dev->slc_cache->slcp.active_zones)){
+			NVMEV_ASSERT(0);
+		}
+		cmd->zno_map = -1;
+		// spin_unlock_irqrestore(&slc_cache->write_lock, flags);
+	}
+
+	// free(cmd);
+
+	return HRTIMER_NORESTART;
+}
+#endif
+
 static enum hrtimer_restart null_cmd_timer_expired(struct hrtimer *timer)
 {
 	end_cmd(container_of(timer, struct nullb_cmd, timer));
@@ -717,10 +904,29 @@ static enum hrtimer_restart null_cmd_timer_expired(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+#ifdef SLC_CACHE
+void null_cmd_end_timer(struct nullb_cmd *cmd)
+#else
 static void null_cmd_end_timer(struct nullb_cmd *cmd)
+#endif
 {
 	ktime_t kt = cmd->nq->dev->completion_nsec;
 
+#ifdef MUST_USE
+	if(cmd->nq->dev->zufs || cmd->nq->dev->ufs){
+		uint64_t nsecs_now = cpu_clock(1);
+		if (cmd->nsecs_target > nsecs_now){
+			kt = cmd->nsecs_target - nsecs_now;
+		}else{
+			kt = 0;
+		}
+		// printk("qwj-null_cmd_end_timer\n");
+	}
+	else 
+		kt = cmd->nq->dev->completion_nsec;
+	// printk("kt = %lu\n",kt);
+#endif	
+	// kt = 121000;
 	hrtimer_start(&cmd->timer, kt, HRTIMER_MODE_REL);
 }
 
@@ -781,7 +987,11 @@ static void null_free_sector(struct nullb *nullb, sector_t sector,
 	if (t_page) {
 		__clear_bit(sector_bit, t_page->bitmap);
 
+#ifdef PREALLOC_SPACE
+		if (is_cache && null_page_empty(t_page)) {
+#else
 		if (null_page_empty(t_page)) {
+#endif
 			ret = radix_tree_delete_item(root, idx, t_page);
 			WARN_ON(ret != t_page);
 			null_free_page(ret);
@@ -1007,6 +1217,32 @@ again:
 	return 0;
 }
 
+#ifdef PREALLOC_SPACE
+static int do_prealloc_space(struct nullb *nullb, u64 start_sector, u64 end_sector)
+{
+	struct nullb_page *t_page;
+	// void *dst;
+
+	// printk("do_prealloc_space - start_sector = %lu - end_sector = %lu\n", start_sector, end_sector);
+	while (start_sector < end_sector) {
+		// printk("do_prealloc_space ---1\n");
+		t_page = null_insert_page(nullb, start_sector, true);
+		if (!t_page)
+			return -ENOSPC;
+
+		// dst = kmap_atomic(t_page->page);
+		// memset(dst, 0, temp);
+		// kunmap_atomic(dst);
+
+		// printk("do_prealloc_space ---2\n");
+		__clear_bit((start_sector) & SECTOR_MASK, t_page->bitmap);
+		start_sector++;
+	}
+	// printk("do_prealloc_space - start_sector = %lu - end_sector = %lu\n", start_sector, end_sector);
+	return 0;
+}
+#endif
+
 static int copy_to_nullb(struct nullb *nullb, struct page *source,
 	unsigned int off, sector_t sector, size_t n, bool is_fua)
 {
@@ -1044,6 +1280,53 @@ static int copy_to_nullb(struct nullb *nullb, struct page *source,
 	return 0;
 }
 
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+static int copy_to_nullb_pi(struct nullb *nullb, struct page *source, struct cwj_pi_tuple *cpt,
+	unsigned int off, sector_t sector, size_t n, bool is_fua)
+{
+	// printk("->copy_to_nullb_pi\n");
+	size_t temp, count = 0;
+	unsigned int offset;
+	struct nullb_page *t_page;
+	void *dst, *src;
+
+	while (count < n) {
+		temp = min_t(size_t, nullb->dev->blocksize, n - count);
+
+		if (null_cache_active(nullb) && !is_fua)
+			null_make_cache_space(nullb, PAGE_SIZE);
+
+		offset = (sector & SECTOR_MASK) << SECTOR_SHIFT;
+		t_page = null_insert_page(nullb, sector,
+			!null_cache_active(nullb) || is_fua);
+		if (!t_page)
+			return -ENOSPC;
+		// t_page->cpt.i_ino = cpt->i_ino;
+		// t_page->cpt.index = cpt->index;
+		// printk("t_page->cpt.i_ino = %u", t_page->cpt.i_ino);
+		// printk("t_page->cpt.index = %u", t_page->cpt.index);
+		src = kmap_atomic(source);
+		dst = kmap_atomic(t_page->page);
+		memcpy(dst + offset, src + off + count, temp);
+		kunmap_atomic(dst);
+		kunmap_atomic(src);
+
+		__set_bit(sector & SECTOR_MASK, t_page->bitmap);
+
+		if (is_fua)
+			null_free_sector(nullb, sector, true);
+
+		count += temp;
+		sector += temp >> SECTOR_SHIFT;
+	}
+	t_page->cpt.i_ino = cpt->i_ino;
+	t_page->cpt.index = cpt->index;
+	// printk("t_page->cpt.i_ino = %u", t_page->cpt.i_ino);
+	// printk("t_page->cpt.index = %u", t_page->cpt.index);
+	return 0;
+}
+#endif
+
 static int copy_from_nullb(struct nullb *nullb, struct page *dest,
 	unsigned int off, sector_t sector, size_t n)
 {
@@ -1075,6 +1358,56 @@ next:
 	}
 	return 0;
 }
+
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+static int copy_from_nullb_pi(struct nullb *nullb, struct page *dest, struct cwj_pi_tuple *cpt,
+	unsigned int off, sector_t sector, size_t n)
+{
+	// printk("->copy_from_nullb_pi\n");
+	size_t temp, count = 0;
+	unsigned int offset;
+	struct nullb_page *t_page;
+	void *dst, *src;
+
+	while (count < n) {
+		temp = min_t(size_t, nullb->dev->blocksize, n - count);
+
+		offset = (sector & SECTOR_MASK) << SECTOR_SHIFT;
+		t_page = null_lookup_page(nullb, sector, false,
+			!null_cache_active(nullb));
+
+		dst = kmap_atomic(dest);
+		if (!t_page) {
+			memset(dst + off + count, 0, temp);
+			goto next;
+		}
+		src = kmap_atomic(t_page->page);
+		memcpy(dst + off + count, src + offset, temp);
+		// cpt->i_ino = t_page->cpt.i_ino;
+		// cpt->index = t_page->cpt.index;
+		// printk("cpt->i_ino = %u", cpt->i_ino);
+		// printk("cpt->index = %u", cpt->index);
+		kunmap_atomic(src);
+next:
+		kunmap_atomic(dst);
+
+		count += temp;
+		sector += temp >> SECTOR_SHIFT;
+	}
+	// printk("1-cpt->i_ino = %u\n", cpt->i_ino);
+	// printk("2-cpt->index = %u\n", cpt->index);
+	if (t_page){
+		cpt->i_ino = t_page->cpt.i_ino;
+		cpt->index = t_page->cpt.index;
+	}else{
+		cpt->i_ino = 0;
+		cpt->index = 0;
+	}
+	// printk("cpt->i_ino = %u\n", cpt->i_ino);
+	// printk("cpt->index = %u\n", cpt->index);
+	return 0;
+}
+#endif
 
 static void nullb_fill_pattern(struct nullb *nullb, struct page *page,
 			       unsigned int len, unsigned int off)
@@ -1158,6 +1491,41 @@ static int null_transfer(struct nullb *nullb, struct page *page,
 	return err;
 }
 
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+static int null_transfer_pi(struct nullb *nullb, struct page *page, struct cwj_pi_tuple *cpt,
+	unsigned int len, unsigned int off, bool is_write, sector_t sector,
+	bool is_fua)
+{
+	struct nullb_device *dev = nullb->dev;
+	unsigned int valid_len = len;
+	int err = 0;
+	// printk("->null_transfer_pi\n");
+	if (!is_write) {
+		//读
+		if (dev->zoned)
+			valid_len = null_zone_valid_read_len(nullb,
+				sector, len);
+
+		if (valid_len) {
+			err = copy_from_nullb_pi(nullb, page, cpt, off,
+				sector, valid_len);
+			off += valid_len;
+			len -= valid_len;
+		}
+
+		if (len)
+			nullb_fill_pattern(nullb, page, len, off);
+		flush_dcache_page(page);
+	} else {
+		//写
+		flush_dcache_page(page);
+		err = copy_to_nullb_pi(nullb, page, cpt, off, sector, len, is_fua);
+	}
+
+	return err;
+}
+#endif
+
 static int null_handle_rq(struct nullb_cmd *cmd)
 {
 	struct request *rq = cmd->rq;
@@ -1168,6 +1536,64 @@ static int null_handle_rq(struct nullb_cmd *cmd)
 	struct req_iterator iter;
 	struct bio_vec bvec;
 
+#ifdef CONFIG_BLK_DEV_INTEGRITY
+	size_t inc = 0;
+	struct bio_integrity_payload *bip;
+	// printk("->null_handle_rq\n");
+
+	spin_lock_irq(&nullb->lock);
+	// rq_for_each_segment(bvec, rq, iter) {
+	// 	len = bvec.bv_len;
+	// 	err = null_transfer(nullb, bvec.bv_page, len, bvec.bv_offset,
+	// 			     op_is_write(req_op(rq)), sector,
+	// 			     rq->cmd_flags & REQ_FUA);
+	// 	if (err) {
+	// 		spin_unlock_irq(&nullb->lock);
+	// 		return err;
+	__rq_for_each_bio(iter.bio, rq) {
+		bip = bio_integrity(iter.bio);		
+		bio_for_each_segment(bvec, iter.bio, iter.iter) {
+			len = bvec.bv_len;
+			// err = null_transfer(nullb, bvec.bv_page, len, bvec.bv_offset,
+			// 			op_is_write(req_op(rq)), sector,
+			// 			rq->cmd_flags & REQ_FUA);
+			// if (err) {
+			// 	spin_unlock_irq(&nullb->lock);
+			// 	return err;
+			// }
+			if(bip && bip->bip_vec)
+			{
+				// printk("bip存在\n");
+				void *pi = bvec_virt(bip->bip_vec);
+				// printk("bvec_virt(bip->bip_vec): 0x%lx\n", pi);
+				pi+=inc;
+				// printk("地址：The value of pi is: 0x%lx\n", pi);
+				// printk("inc = %ld\n",inc);
+				err = null_transfer_pi(nullb, bvec.bv_page, pi, len, bvec.bv_offset,
+							(bio_op(iter.bio) == REQ_OP_ZONE_APPEND) || op_is_write(req_op(rq)), sector,
+							rq->cmd_flags & REQ_FUA);
+				if (err) {
+					spin_unlock_irq(&nullb->lock);
+					return err;
+				}
+				inc += sizeof(struct cwj_pi_tuple);
+			}
+			else
+			{
+				err = null_transfer(nullb, bvec.bv_page, len, bvec.bv_offset,
+						op_is_write(req_op(rq)), sector,
+						rq->cmd_flags & REQ_FUA);
+				if (err) {
+					spin_unlock_irq(&nullb->lock);
+					return err;
+				}
+			}
+			sector += len >> SECTOR_SHIFT;
+		}
+		// sector += len >> SECTOR_SHIFT;
+	}
+	spin_unlock_irq(&nullb->lock);
+#else
 	spin_lock_irq(&nullb->lock);
 	rq_for_each_segment(bvec, rq, iter) {
 		len = bvec.bv_len;
@@ -1181,9 +1607,30 @@ static int null_handle_rq(struct nullb_cmd *cmd)
 		sector += len >> SECTOR_SHIFT;
 	}
 	spin_unlock_irq(&nullb->lock);
+#endif
 
 	return 0;
 }
+
+#ifdef PREALLOC_SPACE
+static int prealloc_space_in_nullb(struct nullb_device *dev)
+{
+	struct nullb *nullb = dev->nullb;
+	int err;
+	u64 end_page = dev->size * 1024 * 1024 / dev->blocksize;
+	u64 start_page = 0;
+	printk("prealloc_space_in_nullb - dev->size = %d - dev->zoned = %d dev->blocksize = %d\n",dev->size, dev->zoned, dev->blocksize);
+	
+	// if(dev->size != 8192)
+		// return 0;
+
+	spin_lock_irq(&nullb->lock);
+	err = do_prealloc_space(nullb, start_page, end_page);
+	spin_unlock_irq(&nullb->lock);
+	printk("prealloc_space_in_nullb - dev->size = %d - dev->zoned = %d dev->blocksize = %d\n",dev->size, dev->zoned, dev->blocksize);
+	return err;
+}
+#endif
 
 static int null_handle_bio(struct nullb_cmd *cmd)
 {
@@ -1270,6 +1717,7 @@ static inline blk_status_t null_handle_memory_backed(struct nullb_cmd *cmd,
 	struct nullb_device *dev = cmd->nq->dev;
 	int err;
 
+	// printk("->null_handle_memory_backed\n");
 	if (op == REQ_OP_DISCARD)
 		return null_handle_discard(dev, sector, nr_sectors);
 
@@ -1346,6 +1794,7 @@ blk_status_t null_process_cmd(struct nullb_cmd *cmd,
 			return ret;
 	}
 
+	// printk("if (dev->memory_backed)\n");
 	if (dev->memory_backed)
 		return null_handle_memory_backed(cmd, op, sector, nr_sectors);
 
@@ -1358,6 +1807,7 @@ static blk_status_t null_handle_cmd(struct nullb_cmd *cmd, sector_t sector,
 	struct nullb_device *dev = cmd->nq->dev;
 	struct nullb *nullb = dev->nullb;
 	blk_status_t sts;
+	// uint64_t tmp1,tmp2;
 
 	if (test_bit(NULLB_DEV_FL_THROTTLED, &dev->flags)) {
 		sts = null_handle_throttled(cmd);
@@ -1369,11 +1819,48 @@ static blk_status_t null_handle_cmd(struct nullb_cmd *cmd, sector_t sector,
 		cmd->error = errno_to_blk_status(null_handle_flush(nullb));
 		goto out;
 	}
-
+	// printk("1-null_handle_cmd -- op = %d dev->zoned = %d\n",op,dev->zoned);
+#ifdef MUST_USE
+	if(dev->zufs || dev->ufs){
+		cmd->nsecs_start = cpu_clock(1);
+		cmd->nsecs_target = cmd->nsecs_start;
+#ifdef SLC_CACHE
+		cmd->nsecs_start_slc = cmd->nsecs_start;
+#endif
+		// printk("qwj-cmd->nsecs_start = cpu_clock(1)\n");
+	}
+#endif
+	// printk("null_handle_cmd-nr_sectors = %llu\n",nr_sectors);
 	if (dev->zoned)
 		sts = null_process_zoned_cmd(cmd, op, sector, nr_sectors);
+#ifdef CONV_FTL
+	else{
+		// printk("2-null_handle_cmd -- op = %d dev->conv_ftls = %x sts = %d BLK_STS_OK = %d\n",op,dev->conv_ftls,sts,BLK_STS_OK);
+		if(dev->ufs && dev->conv_ftls){
+			// tmp1=cpu_clock(1);
+			switch (op) {
+			case REQ_OP_WRITE:
+				conv_write(cmd, sector, nr_sectors);
+				break;
+			case REQ_OP_READ:
+				conv_read(cmd, sector, nr_sectors);
+				break;
+			default:
+				break;
+			}
+			// tmp2=cpu_clock(1);
+			// printk("ufs-cal--- %llu cmd late = %llu\n",tmp2-tmp1,cmd->nsecs_target - cmd->nsecs_start);
+
+		}
+		// tmp1=cpu_clock(1);
+		sts = null_process_cmd(cmd, op, sector, nr_sectors);
+		// tmp2=cpu_clock(1);
+		// printk("ufs-trans---%llu\n",tmp2-tmp1);
+	}
+#else
 	else
 		sts = null_process_cmd(cmd, op, sector, nr_sectors);
+#endif
 
 	/* Do not overwrite errors (e.g. timeout errors) */
 	if (cmd->error == BLK_STS_OK)
@@ -1487,6 +1974,10 @@ static blk_status_t null_queue_rq(struct blk_mq_hw_ctx *hctx,
 		hrtimer_init(&cmd->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 		cmd->timer.function = null_cmd_timer_expired;
 	}
+#ifdef SLC_CACHE
+	cmd->zno_map = -1;
+#endif
+	cmd->queue_id = nq->queue_id;
 	cmd->rq = bd->rq;
 	cmd->error = BLK_STS_OK;
 	cmd->nq = nq;
@@ -1510,7 +2001,8 @@ static blk_status_t null_queue_rq(struct blk_mq_hw_ctx *hctx,
 	}
 	if (cmd->fake_timeout)
 		return BLK_STS_OK;
-
+	// if (nq->queue_id == 0)
+	// 	printk("0-READ 1-WRITE nq->queue_id = %lu, req_op(bd->rq) = %lu\n", nq->queue_id, req_op(bd->rq));//FG - BG
 	return null_handle_cmd(cmd, sector, nr_sectors, req_op(bd->rq));
 }
 
@@ -1559,8 +2051,20 @@ static int null_init_hctx(struct blk_mq_hw_ctx *hctx, void *driver_data,
 	nq = &nullb->queues[hctx_idx];
 	hctx->driver_data = nq;
 	null_init_queue(nullb, nq);
+	nq->queue_id = hctx_idx;//FG - BG
 	nullb->nr_queues++;
 
+	return 0;
+}
+
+int null_map_queues(struct blk_mq_tag_set *set)//FG - BG
+{
+	unsigned int cpu, i;
+	for (i = 0; i < set->nr_maps; i++){
+		for_each_possible_cpu(cpu) {
+			set->map[i].mq_map[cpu] = i;
+		}
+	}
 	return 0;
 }
 
@@ -1570,6 +2074,7 @@ static const struct blk_mq_ops null_mq_ops = {
 	.timeout	= null_timeout_rq,
 	.init_hctx	= null_init_hctx,
 	.exit_hctx	= null_exit_hctx,
+	.map_queues = null_map_queues,//FG - BG
 };
 
 static void null_del_dev(struct nullb *nullb)
@@ -1725,6 +2230,7 @@ static int null_init_tag_set(struct nullb *nullb, struct blk_mq_tag_set *set)
 	set->ops = &null_mq_ops;
 	set->nr_hw_queues = nullb ? nullb->dev->submit_queues :
 						g_submit_queues;
+	set->nr_maps = 2;//FG - BG
 	set->queue_depth = nullb ? nullb->dev->hw_queue_depth :
 						g_hw_queue_depth;
 	set->numa_node = nullb ? nullb->dev->home_node : g_home_node;
@@ -2003,6 +2509,18 @@ static int __init null_init(void)
 			null_free_dev(dev);
 			goto err_dev;
 		}
+// #ifdef ZNS_FTL
+// 		zns_init_namespace(dev, (dev->size * 1024 * 1024));
+// #endif
+// #ifdef PREALLOC_SPACE
+// 		ret = prealloc_space_in_nullb(dev);
+// 		if (ret) {
+// 			pr_info("prealloc space fail !\n");
+// 			null_free_dev(dev);
+// 			null_free_device_storage(dev, false);
+// 			goto err_dev;
+// 		}
+// #endif
 	}
 
 	pr_info("module loaded\n");
@@ -2038,6 +2556,14 @@ static void __exit null_exit(void)
 
 		nullb = list_entry(nullb_list.next, struct nullb, list);
 		dev = nullb->dev;
+#ifdef ZNS_FTL
+		if(dev->zoned)
+			zns_remove_namespace(dev);
+#endif
+#ifdef CONV_FTL
+		if (dev->conv_ftls)
+			conv_remove_namespace(dev);
+#endif
 		null_del_dev(nullb);
 		null_free_dev(dev);
 	}
