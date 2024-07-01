@@ -170,6 +170,7 @@ enum {
 	Opt_qwj_fg_app_io,// FG - BG
 	Opt_qwj_no_zone_write_lock,// FG - BG
 	Opt_cwj_pi,
+	Opt_cwj_recovery,
 	Opt_err,
 };
 
@@ -254,6 +255,7 @@ static match_table_t f2fs_tokens = {
 	{Opt_qwj_fg_app_io, "qwj_fg_app_io"},// FG - BG
 	{Opt_qwj_no_zone_write_lock, "qwj_no_zone_write_lock"},// FG - BG
 	{Opt_cwj_pi, "cwj_pi"},
+	{Opt_cwj_recovery, "cwj_recovery"},
 	{Opt_err, NULL},
 };
 
@@ -729,6 +731,10 @@ static int parse_options(struct super_block *sb, char *options, bool is_remount)
 			F2FS_OPTION(sbi).cwj_pi=true;
 			printk("开启cwj_pi\n");
 			break;
+		case Opt_cwj_recovery:
+			F2FS_OPTION(sbi).cwj_recovery=true;
+			printk("开启cwj_recovery\n");
+			break;	
 		case Opt_qwj_flush_buffer_io:
 			F2FS_OPTION(sbi).qwj_flush_buffer_io=true;
 			break;
@@ -2010,6 +2016,8 @@ static int f2fs_show_options(struct seq_file *seq, struct dentry *root)
 
 	if (F2FS_OPTION(sbi).cwj_pi == true)
 		seq_printf(seq, ",cwj_pi");
+	if (F2FS_OPTION(sbi).cwj_recovery == true)
+		seq_printf(seq, ",cwj_recovery");
 
 	if (test_opt(sbi, GC_MERGE))
 		seq_puts(seq, ",gc_merge");
@@ -2176,6 +2184,7 @@ static void default_options(struct f2fs_sb_info *sbi)
 	F2FS_OPTION(sbi).qwj_no_zone_write_lock = false;// FG - BG
 
 	F2FS_OPTION(sbi).cwj_pi = false;
+	F2FS_OPTION(sbi).cwj_recovery = false;
 
 	sbi->sb->s_flags &= ~SB_INLINECRYPT;
 

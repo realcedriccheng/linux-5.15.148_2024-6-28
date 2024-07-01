@@ -169,6 +169,7 @@ struct f2fs_mount_info {
 	/* For cwj_pi */
 
 	bool cwj_pi;
+	bool cwj_recovery;
 	bool qwj_no_fsync;
 	bool qwj_buffer_io;
 	bool qwj_use_zone_append;
