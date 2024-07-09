@@ -351,7 +351,11 @@ static inline struct sec_entry *get_sec_entry(struct f2fs_sb_info *sbi,
 	struct sit_info *sit_i = SIT_I(sbi);
 	return &sit_i->sec_entries[GET_SEC_FROM_SEG(sbi, segno)];
 }
-
+static inline bool cwj_is_file_switch_temp(struct inode *inode)
+{
+	struct f2fs_inode_info *fi = F2FS_I(inode);
+	return fi->is_switch;
+}
 static inline unsigned int get_valid_blocks(struct f2fs_sb_info *sbi,
 				unsigned int segno, bool use_section)
 {

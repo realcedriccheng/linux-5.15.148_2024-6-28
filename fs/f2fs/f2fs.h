@@ -768,6 +768,17 @@ enum {
 	FI_MAX,			/* max flag, never be used */
 };
 
+#define INIT_CP_VER			0
+
+enum cp_ver_record {
+	FSYNC_CP_VER,	/* cp version of last fsync */
+	WB_CP_VER,	/* cp version of last switch stream */
+	TRUNC_CP_VER,	/* cp version of last truncate write */
+	PUNCH_CP_VER,	/* cp version of last punch write */
+	WRITE_CP_VER,	/* cp version of last write */
+	NR_CP_VER
+};
+
 struct f2fs_inode_info {
 	struct inode vfs_inode;		/* serve a vfs inode */
 	unsigned long i_flags;		/* keep an inode flags for ioctl */
@@ -798,6 +809,19 @@ struct f2fs_inode_info {
 	/* quota space reservation, managed internally by quota code */
 	qsize_t i_reserved_quota;
 #endif
+	// use for cwj_recovery 记录事件版本号
+	unsigned long long cp_ver[NR_CP_VER];
+	// use for cwj_recovery 切换热度
+	int last_temp;	//切换前的热度
+	bool is_switch;	// 是否切换热度
+	atomic_t switch_count;	//切换热度计数
+	spinlock_t temp_lock;	
+	
+
+
+
+
+
 	struct list_head dirty_list;	/* dirty list for dirs and files */
 	struct list_head gdirty_list;	/* linked in global dirty list */
 	struct list_head inmem_ilist;	/* list for inmem inodes */
@@ -1160,6 +1184,15 @@ enum cp_reason_type {
 	CP_FASTBOOT_MODE,
 	CP_SPEC_LOG_NUM,
 	CP_RECOVER_DIR,
+	/* start: for cwj recovery*/
+	CP_SWITCH_STREAM,	//文件切换热度
+	CP_XATTR_DIRTY,		//inode的xattr有修改
+	// CP_OOB_OVERFLOW,	//没有2个sec的限制
+	// CP_OOB_CHG_ATOMIC,	//由atomic commit触发的fsync
+	CP_TRUNCATE_WRITE,
+	CP_PUNCH_WRITE,
+	CP_FSYNC_AFTER_WB,
+	/* end: for cwj recovery*/
 };
 
 enum iostat_type {

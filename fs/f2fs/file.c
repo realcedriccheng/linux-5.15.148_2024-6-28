@@ -216,6 +216,14 @@ static inline enum cp_reason_type need_do_checkpoint(struct inode *inode)
 		f2fs_exist_written_data(sbi, F2FS_I(inode)->i_pino,
 							TRANS_DIR_INO))
 		cp_reason = CP_RECOVER_DIR;
+	else if(F2FS_OPTION(sbi).cwj_recovery)
+	{
+		if (cwj_is_file_switch_temp(inode))
+		{
+			cp_reason = CP_SWITCH_STREAM;
+			printk("CP:CP_SWITCH_STREAM\n");
+		}
+	}
 
 	return cp_reason;
 }
@@ -329,7 +337,7 @@ go_write:
 	if (cp_reason) {
 		/* all the dirty node pages should be flushed for POR */
 		ret = f2fs_sync_fs(inode->i_sb, 1);
-
+		printk("做cp:cpreason=%d\n", cp_reason);
 		/*
 		 * We've secured consistency through sync_fs. Following pino
 		 * will be used only for fsynced inodes after checkpoint.

@@ -3804,6 +3804,14 @@ int f2fs_write_single_data_page(struct page *page, int *submitted,
 		.last_block = last_block,
 	};
 
+	// if(F2FS_OPTION(sbi).cwj_recovery)
+	// {
+	// 	printk("已经打开recovery\n");
+	// }
+	// else {
+	// 	printk("没有打开recovery\n");
+	// }
+
 // #ifdef FG_PID_LIST
 // 	if (io_type == APP_BUFFERED_IO)
 // 	{
@@ -3967,7 +3975,6 @@ static int f2fs_write_data_page(struct page *page,
 	}
 out:
 #endif
-
 	return f2fs_write_single_data_page(page, NULL, NULL, NULL,
 						wbc, FS_DATA_IO, 0, true);
 }

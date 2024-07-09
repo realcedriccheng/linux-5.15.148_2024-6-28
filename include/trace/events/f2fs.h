@@ -145,7 +145,12 @@ TRACE_DEFINE_ENUM(CP_RESIZE);
 		{ CP_NODE_NEED_CP,	"node needs cp" },		\
 		{ CP_FASTBOOT_MODE,	"fastboot mode" },		\
 		{ CP_SPEC_LOG_NUM,	"log type is 2" },		\
-		{ CP_RECOVER_DIR,	"dir needs recovery" })
+		{ CP_RECOVER_DIR,	"dir needs recovery" },	\
+		{ CP_SWITCH_STREAM,	"stream has switched" },	\
+		{ CP_XATTR_DIRTY,	"xattr needs recovery" },	\
+		{ CP_TRUNCATE_WRITE,	"truncate needs cp" },	\
+		{ CP_PUNCH_WRITE,	"punch needs cp" },	\
+		{ CP_FSYNC_AFTER_WB,	"after writeback needs cp" })
 
 #define show_shutdown_mode(type)					\
 	__print_symbolic(type,						\

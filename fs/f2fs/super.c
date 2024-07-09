@@ -1425,6 +1425,7 @@ default_check:
 static struct inode *f2fs_alloc_inode(struct super_block *sb)
 {
 	struct f2fs_inode_info *fi;
+	int i;
 
 	fi = f2fs_kmem_cache_alloc(f2fs_inode_cachep,
 				GFP_F2FS_ZERO, false, F2FS_SB(sb));
@@ -1446,6 +1447,20 @@ static struct inode *f2fs_alloc_inode(struct super_block *sb)
 	init_rwsem(&fi->i_gc_rwsem[READ]);
 	init_rwsem(&fi->i_gc_rwsem[WRITE]);
 	init_rwsem(&fi->i_xattr_sem);
+	
+	//切换热度相关
+	fi->last_temp = NR_PERSISTENT_LOG;
+	fi->is_switch = false;
+	printk("is_switch = false:初始化inode\n");
+	atomic_set(&fi->switch_count, 0);
+	spin_lock_init(&fi->temp_lock);
+	//初始化各个版本号
+	if (F2FS_CKPT(F2FS_SB(sb))) {
+	/* ckpt is NULL when alloc meta_inode */
+
+	for (i = 0; i < NR_CP_VER; i++)
+		fi->cp_ver[i] = INIT_CP_VER;
+	}
 
 	/* Will be used by directory only */
 	fi->i_dir_level = F2FS_SB(sb)->dir_level;

@@ -15,6 +15,9 @@
 #include <linux/timer.h>
 #include <linux/freezer.h>
 #include <linux/sched/signal.h>
+//用于测试的随机数
+#include <linux/prandom.h>
+
 
 #include "f2fs.h"
 #include "segment.h"
@@ -3612,12 +3615,68 @@ static void update_device_state(struct f2fs_io_info *fio)
 		spin_unlock(&sbi->dev_lock);
 	}
 }
-
+void cwj_file_check_switch_temp(struct inode *inode, int type)
+{
+	struct f2fs_sb_info *sbi;
+	struct f2fs_inode_info *fi;
+	if (!(type == CURSEG_HOT_DATA || type == CURSEG_WARM_DATA || type ==CURSEG_COLD_DATA)) {
+		return;
+	}
+	sbi = F2FS_I_SB(inode);
+	fi = F2FS_I(inode);
+	spin_lock(&fi->temp_lock);
+	if(fi->cp_ver[WB_CP_VER] != cur_cp_version(F2FS_CKPT(sbi))) {
+		// 刚初始化的inode / 上一次写入是上次CP以前
+		printk("is_switch = false:刚初始化的inode / 上一次写入是上次CP以前\n");
+		printk("版本号：fi->cp_ver[WB_CP_VER]=%lld -> cur_cp_version=%lld\n", fi->cp_ver[WB_CP_VER],cur_cp_version(F2FS_CKPT(sbi)));
+		fi->is_switch = false;
+		fi->last_temp = type;
+		fi->cp_ver[WB_CP_VER] = cur_cp_version(F2FS_CKPT(sbi));
+		spin_unlock(&fi->temp_lock);
+		return;
+	}
+	//is_switch只有在CP后和初始化inode的时候会置为false
+	if (fi->is_switch || fi->last_temp == NR_PERSISTENT_LOG || fi->last_temp == type) {
+		//上次CP后切换过热度 || 自从上次CP之后没有写入过，因为写入就要check switch，check就要更新temp状态 || 没有改变热度
+		if (unlikely(fi->last_temp == NR_PERSISTENT_LOG))
+			fi->last_temp = type;	//这个文件首次写入
+		spin_unlock(&fi->temp_lock);
+		return;
+	}
+	// 确实切换了热度
+	printk("is_switch = true:确实切换了热度\n");
+	fi->is_switch = true;
+	atomic_inc(&fi->switch_count);
+	printk("inode%u switch stream[%d->%d][%d]",
+		inode->i_ino, fi->last_temp, type,
+		atomic_read(&fi->switch_count));
+	spin_unlock(&fi->temp_lock);
+	//这个时候不用记录last_temp，是因为语义上来说不调用fsync就不需要恢复，一旦调用fsync就会做cp，只要cp那么热度又在上面第二个if设置了。
+}
 static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
 {
 	int type = __get_segment_type(fio);
 	bool keep_order = (f2fs_lfs_mode(fio->sbi) && type == CURSEG_COLD_DATA);
-
+	// 为了测试切换热度，这里将type随机设置
+	if(type == CURSEG_HOT_DATA || type == CURSEG_WARM_DATA || type == CURSEG_COLD_DATA)
+	{
+		u32 pseudo_random_number = prandom_u32();
+		int random_type = pseudo_random_number % 3;
+		switch (random_type) {
+			case 0:
+				type = CURSEG_HOT_DATA;
+				break;
+			case 1:
+				type = CURSEG_WARM_DATA;
+				break;
+			case 2:
+				type = CURSEG_COLD_DATA;
+				break;
+			default:
+				type = CURSEG_COLD_DATA;
+		}
+		printk("random_type=%d\ntemp type = %d\n", random_type, type);
+	}
 	if (keep_order)
 		down_read(&fio->sbi->io_order_lock);
 reallocate:
@@ -3628,6 +3687,26 @@ reallocate:
 					fio->old_blkaddr, fio->old_blkaddr);
 		f2fs_invalidate_compress_page(fio->sbi, fio->old_blkaddr);
 	}
+	
+	struct address_space *mapping;
+
+    // 获取 page 结构体中的 mapping 字段
+    mapping = fio->page->mapping;
+
+    // 检查 mapping 是否为 NULL
+    if (mapping) {
+        printk("切换热度检查：有mapping\n");
+
+		cwj_file_check_switch_temp(fio->page->mapping->host, type);
+
+		if(cwj_is_file_switch_temp(fio->page->mapping->host))
+		{
+			printk("切换热度检查：ino = %d, is_switch = true", fio->ino);
+		}
+		else {
+			printk("切换热度检查：ino = %d, is_switch = false", fio->ino);
+		}
+    }
 
 	/* writeout dirty page into bdev */
 	f2fs_submit_page_write(fio);
