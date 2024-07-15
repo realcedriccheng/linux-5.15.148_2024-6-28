@@ -366,16 +366,16 @@ static inline bool cwj_is_file_truncate_write(struct inode *inode, enum cp_ver_r
 static inline void cwj_inode_set_fofs(struct f2fs_sb_info *sbi,
 		struct f2fs_inode_info *fi, loff_t fofs)
 {
-	// if (fi->cp_ver[WRITE_CP_VER] != cur_cp_version(F2FS_CKPT(sbi))) {
-	// 	if(fi->vfs_inode.i_ino>=4)
-	// 		printk("WRITE_CP_VER版本号不是当前的，由%d->%d\n", fi->cp_ver[WRITE_CP_VER], cur_cp_version(F2FS_CKPT(sbi)));
-	// 	fi->cp_ver[WRITE_CP_VER] = cur_cp_version(F2FS_CKPT(sbi));
-	// 	fi->fofs = fofs;
-	// } else {
+	if (fi->cp_ver[WRITE_CP_VER] != cur_cp_version(F2FS_CKPT(sbi))) {
+		if(fi->vfs_inode.i_ino>=4)
+			printk("WRITE_CP_VER版本号不是当前的，由%d->%d\n", fi->cp_ver[WRITE_CP_VER], cur_cp_version(F2FS_CKPT(sbi)));
+		fi->cp_ver[WRITE_CP_VER] = cur_cp_version(F2FS_CKPT(sbi));
+		fi->fofs = fofs;
+	} else {
 		if(fi->vfs_inode.i_ino>=4)
 			printk("WRITE_CP_VER版本号是当前cp_ver=%d\n", fi->cp_ver[WRITE_CP_VER]);
 		fi->fofs = max(fofs, fi->fofs);
-	// }
+	}
 }
 static inline unsigned int get_valid_blocks(struct f2fs_sb_info *sbi,
 				unsigned int segno, bool use_section)
