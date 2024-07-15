@@ -811,6 +811,7 @@ struct f2fs_inode_info {
 #endif
 	// use for cwj_recovery 记录事件版本号
 	unsigned long long cp_ver[NR_CP_VER];
+	loff_t fofs;	//记录文件修改最远位置
 	// use for cwj_recovery 切换热度
 	int last_temp;	//切换前的热度
 	bool is_switch;	// 是否切换热度
@@ -3408,6 +3409,8 @@ void f2fs_update_inode_page(struct inode *inode);
 int f2fs_write_inode(struct inode *inode, struct writeback_control *wbc);
 void f2fs_evict_inode(struct inode *inode);
 void f2fs_handle_failed_inode(struct inode *inode);
+
+bool cwj_is_node_page_dirty(struct f2fs_sb_info *sbi, nid_t nid);
 
 /*
  * namei.c

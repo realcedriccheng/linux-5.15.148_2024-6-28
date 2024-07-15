@@ -3627,8 +3627,8 @@ void cwj_file_check_switch_temp(struct inode *inode, int type)
 	spin_lock(&fi->temp_lock);
 	if(fi->cp_ver[WB_CP_VER] != cur_cp_version(F2FS_CKPT(sbi))) {
 		// 刚初始化的inode / 上一次写入是上次CP以前
-		printk("is_switch = false:刚初始化的inode / 上一次写入是上次CP以前\n");
-		printk("版本号：fi->cp_ver[WB_CP_VER]=%lld -> cur_cp_version=%lld\n", fi->cp_ver[WB_CP_VER],cur_cp_version(F2FS_CKPT(sbi)));
+		// printk("is_switch = false:刚初始化的inode / 上一次写入是上次CP以前\n");
+		// printk("版本号：fi->cp_ver[WB_CP_VER]=%lld -> cur_cp_version=%lld\n", fi->cp_ver[WB_CP_VER],cur_cp_version(F2FS_CKPT(sbi)));
 		fi->is_switch = false;
 		fi->last_temp = type;
 		fi->cp_ver[WB_CP_VER] = cur_cp_version(F2FS_CKPT(sbi));
@@ -3644,7 +3644,7 @@ void cwj_file_check_switch_temp(struct inode *inode, int type)
 		return;
 	}
 	// 确实切换了热度
-	printk("is_switch = true:确实切换了热度\n");
+	// printk("is_switch = true:确实切换了热度\n");
 	fi->is_switch = true;
 	atomic_inc(&fi->switch_count);
 	printk("inode%u switch stream[%d->%d][%d]",
@@ -3658,25 +3658,25 @@ static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
 	int type = __get_segment_type(fio);
 	bool keep_order = (f2fs_lfs_mode(fio->sbi) && type == CURSEG_COLD_DATA);
 	// 为了测试切换热度，这里将type随机设置
-	if(type == CURSEG_HOT_DATA || type == CURSEG_WARM_DATA || type == CURSEG_COLD_DATA)
-	{
-		u32 pseudo_random_number = prandom_u32();
-		int random_type = pseudo_random_number % 3;
-		switch (random_type) {
-			case 0:
-				type = CURSEG_HOT_DATA;
-				break;
-			case 1:
-				type = CURSEG_WARM_DATA;
-				break;
-			case 2:
-				type = CURSEG_COLD_DATA;
-				break;
-			default:
-				type = CURSEG_COLD_DATA;
-		}
-		printk("random_type=%d\ntemp type = %d\n", random_type, type);
-	}
+	// if(type == CURSEG_HOT_DATA || type == CURSEG_WARM_DATA || type == CURSEG_COLD_DATA)
+	// {
+	// 	u32 pseudo_random_number = prandom_u32();
+	// 	int random_type = pseudo_random_number % 3;
+	// 	switch (random_type) {
+	// 		case 0:
+	// 			type = CURSEG_HOT_DATA;
+	// 			break;
+	// 		case 1:
+	// 			type = CURSEG_WARM_DATA;
+	// 			break;
+	// 		case 2:
+	// 			type = CURSEG_COLD_DATA;
+	// 			break;
+	// 		default:
+	// 			type = CURSEG_COLD_DATA;
+	// 	}
+	// 	printk("random_type=%d\ntemp type = %d\n", random_type, type);
+	// }
 	if (keep_order)
 		down_read(&fio->sbi->io_order_lock);
 reallocate:
@@ -3695,16 +3695,16 @@ reallocate:
 
     // 检查 mapping 是否为 NULL
     if (mapping) {
-        printk("切换热度检查：有mapping\n");
+        // printk("切换热度检查：有mapping\n");
 
 		cwj_file_check_switch_temp(fio->page->mapping->host, type);
 
 		if(cwj_is_file_switch_temp(fio->page->mapping->host))
 		{
-			printk("切换热度检查：ino = %d, is_switch = true", fio->ino);
+			// printk("切换热度检查：ino = %d, is_switch = true", fio->ino);
 		}
 		else {
-			printk("切换热度检查：ino = %d, is_switch = false", fio->ino);
+			// printk("切换热度检查：ino = %d, is_switch = false", fio->ino);
 		}
     }
 

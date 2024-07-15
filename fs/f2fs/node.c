@@ -1723,6 +1723,18 @@ static int f2fs_write_node_page(struct page *page,
 						FS_NODE_IO, NULL);
 }
 
+bool cwj_is_node_page_dirty(struct f2fs_sb_info *sbi, nid_t nid)
+{
+	struct page *page = NULL;
+
+	pgoff_t index = nid;
+	int nr_pages = find_get_pages_range_tag(NODE_MAPPING(sbi), &index, index,
+			PAGECACHE_TAG_DIRTY, 1, &page);
+	f2fs_put_page(page, 0);
+
+	return (nr_pages > 0);
+}
+
 int f2fs_fsync_node_pages(struct f2fs_sb_info *sbi, struct inode *inode,
 			struct writeback_control *wbc, bool atomic,
 			unsigned int *seq_id)

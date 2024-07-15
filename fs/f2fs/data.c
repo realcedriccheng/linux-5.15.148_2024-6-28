@@ -147,6 +147,19 @@ static blk_status_t cwj_bio_integrity_process(struct bio *bio,
 		// printk("i=%d\n",i);
 		i++;
 		// printk("bv.bv_page->index=%d\n",bv.bv_page->index);
+		//设置fofs
+		struct f2fs_sb_info *sbi = F2FS_P_SB(bv.bv_page);
+		struct f2fs_inode_info *fi = F2FS_I(bv.bv_page->mapping->host);
+		
+		if(fi->vfs_inode.i_ino>=4)
+			printk("文件ino = %ld, 正在设置fofs\n设置前的fofs = %d，bv.bv_page->index = %d，F2FS_BYTES_TO_BLK(bv.bv_len)=%d\n", fi->vfs_inode.i_ino, fi->fofs, bv.bv_page->index, F2FS_BYTES_TO_BLK(bv.bv_len));
+		
+		cwj_inode_set_fofs(sbi, fi,
+				bv.bv_page->index + F2FS_BYTES_TO_BLK(bv.bv_len));
+		
+		if(fi->vfs_inode.i_ino>=4)
+			printk("设置后的fofs=%d\n", fi->fofs);
+		
 		iter.data_buf = kaddr;
 		iter.data_size = bv.bv_len;
 		ret = proc_fn(&iter);

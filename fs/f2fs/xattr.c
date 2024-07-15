@@ -284,7 +284,7 @@ static int read_inline_xattr(struct inode *inode, struct page *ipage,
 	unsigned int inline_size = inline_xattr_size(inode);
 	struct page *page = NULL;
 	void *inline_addr;
-
+	//从f2fs_xattr_generic_get传过来的ipage==NULL
 	if (ipage) {
 		inline_addr = inline_xattr_addr(inode, ipage);
 	} else {
@@ -362,7 +362,7 @@ static int lookup_all_xattrs(struct inode *inode, struct page *ipage,
 		if (err)
 			goto out;
 	}
-
+	// 说明可能既有内联的xattr又有外部的xattr
 	if (last_addr)
 		cur_addr = XATTR_HDR(last_addr) - 1;
 	else
@@ -533,6 +533,7 @@ int f2fs_getxattr(struct inode *inode, int index, const char *name,
 		return -ERANGE;
 
 	down_read(&F2FS_I(inode)->i_xattr_sem);
+	// 查询对应的键值对
 	error = lookup_all_xattrs(inode, ipage, index, len, name,
 				&entry, &base_addr, &base_size, &is_inline);
 	up_read(&F2FS_I(inode)->i_xattr_sem);
@@ -554,6 +555,7 @@ int f2fs_getxattr(struct inode *inode, int index, const char *name,
 			goto out;
 		}
 		memcpy(buffer, pval, size);
+		//最终结果是将查询到的值复制到buffer
 	}
 	error = size;
 out:
@@ -796,6 +798,7 @@ int f2fs_setxattr(struct inode *inode, int index, const char *name,
 	if (ipage)
 		return __f2fs_setxattr(inode, index, name, value,
 						size, ipage, flags);
+	// 做一次GC？
 	f2fs_balance_fs(sbi, true);
 
 	f2fs_lock_op(sbi);

@@ -191,7 +191,9 @@ static int get_parent_ino(struct inode *inode, nid_t *pino)
 static inline enum cp_reason_type need_do_checkpoint(struct inode *inode)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	struct f2fs_inode_info *fi = F2FS_I(inode);
 	enum cp_reason_type cp_reason = CP_NO_NEEDED;
+	nid_t nid = fi->i_xattr_nid;
 
 	if (!S_ISREG(inode->i_mode))
 		cp_reason = CP_NON_REGULAR;
@@ -222,6 +224,21 @@ static inline enum cp_reason_type need_do_checkpoint(struct inode *inode)
 		{
 			cp_reason = CP_SWITCH_STREAM;
 			printk("CP:CP_SWITCH_STREAM\n");
+		}
+		else if(nid && cwj_is_node_page_dirty(sbi, nid))
+		{
+			cp_reason = CP_XATTR_DIRTY;
+			printk("CP:CP_XATTR_DIRTY");
+		}
+		else if (cwj_is_file_truncate_write(inode, TRUNC_CP_VER))
+		{
+			cp_reason = CP_TRUNCATE_WRITE;
+			printk("CP:CP_TRUNCATE_WRITE");
+		}
+		else if (cwj_is_file_truncate_write(inode, PUNCH_CP_VER))
+		{
+			cp_reason = CP_PUNCH_WRITE;
+			printk("CP:CP_PUNCH_WRITE");
 		}
 	}
 
@@ -267,6 +284,7 @@ static int f2fs_do_sync_file(struct file *file, loff_t start, loff_t end,
 		.for_reclaim = 0,
 	};
 	unsigned int seq_id = 0;
+	struct f2fs_inode_info *fi = F2FS_I(inode);
 
 	if (unlikely(f2fs_readonly(inode->i_sb)))
 		return 0;
@@ -330,6 +348,11 @@ go_write:
 	 * Both of fdatasync() and fsync() are able to be recovered from
 	 * sudden-power-off.
 	 */
+	
+	if (cwj_is_file_truncate_write(inode, TRUNC_CP_VER) &&
+			F2FS_BLK_TO_BYTES(fi->fofs) <= inode->i_size)
+		fi->cp_ver[TRUNC_CP_VER] = 0;
+
 	down_read(&F2FS_I(inode)->i_sem);
 	cp_reason = need_do_checkpoint(inode);
 	up_read(&F2FS_I(inode)->i_sem);
@@ -395,6 +418,9 @@ flush_out:
 	}
 	f2fs_update_time(sbi, REQ_TIME);
 out:
+	fi->cp_ver[FSYNC_CP_VER] = cur_cp_version(F2FS_CKPT(sbi));
+	fi->cp_ver[TRUNC_CP_VER] = 0;
+	fi->cp_ver[PUNCH_CP_VER] = 0;
 	trace_f2fs_sync_file_exit(inode, cp_reason, datasync, ret);
 	return ret;
 }
@@ -786,6 +812,8 @@ int f2fs_truncate_blocks(struct inode *inode, u64 from, bool lock)
 int f2fs_truncate(struct inode *inode)
 {
 	int err;
+	struct f2fs_inode_info *fi = F2FS_I(inode);
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(inode))))
 		return -EIO;
@@ -815,7 +843,9 @@ int f2fs_truncate(struct inode *inode)
 	err = f2fs_truncate_blocks(inode, i_size_read(inode), true);
 	if (err)
 		return err;
-
+	//记录truncate操作发生在哪次cp之后
+	fi->cp_ver[TRUNC_CP_VER] = cur_cp_version(F2FS_CKPT(sbi));
+	printk("ino=%d发生truncate操作，fi->cp_ver[TRUNC_CP_VER]变为%d\n;", inode->i_ino, fi->cp_ver[TRUNC_CP_VER]);
 	inode->i_mtime = inode->i_ctime = current_time(inode);
 	f2fs_mark_inode_dirty_sync(inode, false);
 	return 0;
