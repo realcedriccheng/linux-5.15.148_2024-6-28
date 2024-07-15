@@ -325,7 +325,9 @@ static int f2fs_do_sync_file(struct file *file, loff_t start, loff_t end,
 		/* it may call write_inode just prior to fsync */
 		if (need_inode_page_update(sbi, ino))
 			goto go_write;
-
+		if (hmfs_is_file_truncate_write(inode, TRUNC_CP_VER) ||
+				hmfs_is_file_truncate_write(inode, PUNCH_CP_VER))
+			goto go_write;
 		if (is_inode_flag_set(inode, FI_UPDATE_WRITE) ||
 				f2fs_exist_written_data(sbi, ino, UPDATE_INO))
 			goto flush_out;
