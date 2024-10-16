@@ -1447,7 +1447,7 @@ static struct inode *f2fs_alloc_inode(struct super_block *sb)
 	init_rwsem(&fi->i_gc_rwsem[READ]);
 	init_rwsem(&fi->i_gc_rwsem[WRITE]);
 	init_rwsem(&fi->i_xattr_sem);
-	
+	fi->has_wb = false;
 	//切换热度相关
 	fi->last_temp = NR_PERSISTENT_LOG;
 	fi->is_switch = false;
@@ -1782,7 +1782,7 @@ int f2fs_sync_fs(struct super_block *sb, int sync)
 
 	if (sync)
 		err = f2fs_issue_checkpoint(sbi);
-
+	printk("f2fs_sync_fs:CP\n");
 	return err;
 }
 

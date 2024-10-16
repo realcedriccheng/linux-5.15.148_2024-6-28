@@ -3953,7 +3953,11 @@ out:
 	}
 
 	if (submitted)
+	{
 		*submitted = fio.submitted ? 1 : 0;
+		if (*submitted && (F2FS_I(inode)->fsync_task != current))
+			F2FS_I(inode)->has_wb = true;
+	}
 
 	return 0;
 
@@ -4004,11 +4008,13 @@ static int f2fs_write_cache_pages(struct address_space *mapping,
 	int ret = 0;
 	int done = 0, retry = 0;
 	struct pagevec pvec;
+	struct inode *inode = mapping->host;
+	struct f2fs_inode_info *fi = F2FS_I(inode);
 	struct f2fs_sb_info *sbi = F2FS_M_SB(mapping);
 	struct bio *bio = NULL;
 	sector_t last_block;
 #ifdef CONFIG_F2FS_FS_COMPRESSION
-	struct inode *inode = mapping->host;
+	// struct inode *inode = mapping->host;
 	struct compress_ctx cc = {
 		.inode = inode,
 		.log_cluster_size = F2FS_I(inode)->i_log_cluster_size,
@@ -4241,8 +4247,12 @@ next:
 		mapping->writeback_index = done_index;
 
 	if (nwritten)
+	{
 		f2fs_submit_merged_write_cond(F2FS_M_SB(mapping), mapping->host,
 								NULL, 0, DATA);
+		if ((fi->fsync_task != current) && (io_type == FS_DATA_IO))
+			fi->has_wb = true;
+	}
 	/* submit cached bio of IPU write */
 	if (bio)
 		f2fs_submit_merged_ipu_write(sbi, &bio, NULL);

@@ -817,8 +817,10 @@ struct f2fs_inode_info {
 	bool is_switch;	// 是否切换热度
 	atomic_t switch_count;	//切换热度计数
 	spinlock_t temp_lock;	
-	
-
+	int fsync_dirty_pages;
+	bool has_wb;
+	struct page *oob_last_page;
+	struct task_struct *fsync_task;	/* whether in fsync flow, protect by i_rwsem */
 
 
 

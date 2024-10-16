@@ -228,20 +228,25 @@ static inline enum cp_reason_type need_do_checkpoint(struct inode *inode)
 		else if(nid && cwj_is_node_page_dirty(sbi, nid))
 		{
 			cp_reason = CP_XATTR_DIRTY;
-			printk("CP:CP_XATTR_DIRTY");
+			printk("CP:CP_XATTR_DIRTY\n");
 		}
 		else if (cwj_is_file_truncate_write(inode, TRUNC_CP_VER))
 		{
 			cp_reason = CP_TRUNCATE_WRITE;
-			printk("CP:CP_TRUNCATE_WRITE");
+			printk("CP:CP_TRUNCATE_WRITE\n");
 		}
 		else if (cwj_is_file_truncate_write(inode, PUNCH_CP_VER))
 		{
 			cp_reason = CP_PUNCH_WRITE;
-			printk("CP:CP_PUNCH_WRITE");
+			printk("CP:CP_PUNCH_WRITE\n");
+		}
+		else if (cwj_is_file_fsync_after_wb(inode))
+		{
+			cp_reason = CP_FSYNC_AFTER_WB;
+			printk("CP:CP_FSYNC_AFTER_WB\n");
 		}
 	}
-
+	printk("CP:cp_reason=%d\n", cp_reason);
 	return cp_reason;
 }
 
@@ -325,8 +330,8 @@ static int f2fs_do_sync_file(struct file *file, loff_t start, loff_t end,
 		/* it may call write_inode just prior to fsync */
 		if (need_inode_page_update(sbi, ino))
 			goto go_write;
-		if (hmfs_is_file_truncate_write(inode, TRUNC_CP_VER) ||
-				hmfs_is_file_truncate_write(inode, PUNCH_CP_VER))
+		if (cwj_is_file_truncate_write(inode, TRUNC_CP_VER) ||
+				cwj_is_file_truncate_write(inode, PUNCH_CP_VER))
 			goto go_write;
 			//有什么作用？
 		if (is_inode_flag_set(inode, FI_UPDATE_WRITE) ||
@@ -424,6 +429,13 @@ out:
 	fi->cp_ver[FSYNC_CP_VER] = cur_cp_version(F2FS_CKPT(sbi));
 	fi->cp_ver[TRUNC_CP_VER] = 0;
 	fi->cp_ver[PUNCH_CP_VER] = 0;
+	fi->has_wb = false;
+	if (cp_reason) {
+		spin_lock(&fi->temp_lock);
+		fi->is_switch = false;
+		fi->last_temp = NR_PERSISTENT_LOG;
+		spin_unlock(&fi->temp_lock);
+	}
 	trace_f2fs_sync_file_exit(inode, cp_reason, datasync, ret);
 	return ret;
 }
@@ -1787,6 +1799,8 @@ static long f2fs_fallocate(struct file *file, int mode,
 				loff_t offset, loff_t len)
 {
 	struct inode *inode = file_inode(file);
+	struct f2fs_inode_info *fi = F2FS_I(inode);
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	long ret = 0;
 
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(inode))))
@@ -1817,6 +1831,7 @@ static long f2fs_fallocate(struct file *file, int mode,
 	inode_lock(inode);
 
 	ret = file_modified(file);
+	// 此处函数有什么意义？
 	if (ret)
 		goto out;
 

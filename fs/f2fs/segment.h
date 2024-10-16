@@ -377,6 +377,22 @@ static inline void cwj_inode_set_fofs(struct f2fs_sb_info *sbi,
 		fi->fofs = max(fofs, fi->fofs);
 	}
 }
+static inline bool cwj_is_file_fsync_after_wb(struct inode *inode)
+{
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	struct f2fs_inode_info *fi = F2FS_I(inode);
+	unsigned long long cur_ver = cur_cp_version(F2FS_CKPT(sbi));
+	/*
+	 * Data has been flushed by wb, so oob w/o fsync mark.
+	 * In this case, it should flush inode or CP.
+	 * It's difficult to hit this kind of scene, so choose CP.
+	 */
+	if (!fi->fsync_dirty_pages && fi->has_wb &&
+			fi->cp_ver[FSYNC_CP_VER] != cur_ver)
+		return true;
+
+	return false;
+}
 static inline unsigned int get_valid_blocks(struct f2fs_sb_info *sbi,
 				unsigned int segno, bool use_section)
 {
